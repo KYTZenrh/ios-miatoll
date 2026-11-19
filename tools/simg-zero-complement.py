@@ -17,7 +17,7 @@ out = []   # (type, blocks)
 for _ in range(nchunks):
     t, _, n, tot = struct.unpack('<HHII', f.read(12))
     f.seek(tot - 12, 1)
-    nt = DONTCARE if t == RAW else FILL if t == DONTCARE else None
+    nt = DONTCARE if t in (RAW, FILL) else FILL if t == DONTCARE else None  # FILL: AOSP img2simg zero runs, written by the image itself
     assert nt, hex(t)
     if out and out[-1][0] == nt:
         out[-1][1] += n
