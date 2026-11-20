@@ -1,0 +1,233 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index 310fed2..9a27f98 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -4314,6 +4314,19 @@ sp_read(uint16_t apid, uint8_t addr, uint8_t *out)
+ 	return ETIMEDOUT;
+ }
+ 
++/* 0221: one PMIC register for bsd/dev/sweet_usb.c (it logs the USB PHY supplies on a cold bring-up) */
++int sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++
++int
++sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out)
++{
++	if (sp_init()) {
++		return ENOMEM;
++	}
++	uint16_t apid = sp_find_apid(ppid);
++	return apid == SP_NO_APID ? ENOENT : sp_read(apid, addr, out);
++}
++
+ /*
+  * Real time. The PM6150 RTC (SID 0, PID 0x60) is a 32-bit seconds counter that keeps running across reboots (and
+  * with the phone off). Android never writes wall-clock time into it, so a fresh phone holds an arbitrary counter.
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 8b80c9d..c1fb523 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -45,7 +45,9 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
++static bool usb_cold_init(vm_offset_t gcc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern int sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);  /* bsd/dev/sweet_modem.inc */
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+@@ -67,7 +69,7 @@ static const struct {
+ 
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
++#define QUSB2_PA                0x088e3000      /* 0221: live DT qusb@88e3000 (0x088e2000 was sdmmagpie's) */
+ #define QUSB2_SIZE              0x00000400
+ 
+ static uint32_t
+@@ -95,6 +97,18 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
++	/* 0221: sweetusbinit=-1 (default): bring the controller up ourselves when ABL left the GDSC off (a normal
++	 * boot from flash); 1 always (tests that path under `fastboot boot`); 0 never */
++	int init = -1;
++	PE_parse_boot_argn("sweetusbinit", &init, sizeof(init));
++	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	if (enabled >= 2 && (init == 1 || (init == -1 && !(gdscr & (1u << 31))))) {
++		printf("SWEET USB: cold bring-up (GDSC 0x%08x)\n", gdscr);
++		if (!usb_cold_init(gcc)) {
++			printf("SWEET USB: cold bring-up failed\n");
++			return;
++		}
++	}
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+@@ -179,6 +193,166 @@ sweet_usb_probe(void)
+ #define QSCRATCH_SS_PHY_CTRL    0x30
+ #define   LANE0_PWR_PRESENT     (1u << 24)
+ 
++/*
++ * 0221: cold bring-up. ABL powers USB only in fastboot mode; after a normal boot from flash the USB30_PRIM GDSC
++ * is off and nothing is set up. Same steps and order as Linux 4.14 (LineageOS sm6250): dwc3-msm.c
++ * dwc3_msm_resume (xo, GDSC, core_reset BCR, clocks), dwc3 core.c dwc3_phy_setup / dwc3_core_soft_reset (PHY
++ * reset + qusb_phy_init of phy-msm-qusb-v2.c) / dwc3_core_setup_global_control, and dwc3-msm's high-speed-only
++ * QSCRATCH UTMI clock switch. GCC offsets: gcc-atoll.c; PHY table: live DT qusb@88e3000 qcom,qusb-phy-init-seq.
++ * The PHY supplies (pm6150 L4/L11/L17) are RPMh regulators this kernel cannot switch: only logged.
++ */
++#define GCC_USB30_PRIM_BCR      0x0f000
++#define GCC_USB30_MASTER_RCG    0x0f01c         /* gcc_usb30_prim_master_clk_src CMD_RCGR, CFG_RCGR at +4 */
++#define GCC_QUSB2PHY_PRIM_BCR   0x26000
++#define GCC_CLKREF              0x8c010         /* gcc_usb3_prim_clkref_clk, dwc3-msm "xo" */
++#define CBCR_HWCG               (1u << 1)
++#define CBCR_ENABLE             (1u << 0)
++#define GUSB2PHYCFG             0xc200
++#define QSCRATCH_GENERAL_CFG    0x08
++#define QUSB2_PLL_STATUS        0x1a0           /* PLL_COMMON_STATUS_ONE, bit 0 CORE_READY */
++#define QUSB2_PWR_CTRL1         0x210           /* bit 0 POWR_DOWN */
++
++static const uint16_t qusb2_init_seq[][2] = {   /* { offset, value } */
++	{ 0x210, 0x23 }, { 0x004, 0x03 }, { 0x18c, 0x7c }, { 0x02c, 0x80 }, { 0x184, 0x0a }, { 0x0b4, 0x19 },
++	{ 0x194, 0x40 }, { 0x198, 0x16 }, { 0x214, 0x21 }, { 0x220, 0x08 }, { 0x224, 0x58 }, { 0x240, 0x67 },
++	{ 0x244, 0x28 }, { 0x248, 0xca }, { 0x24c, 0x04 }, { 0x250, 0x03 }, { 0x23c, 0x30 }, { 0x210, 0x22 },
++};
++
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* clk_branch2_enable: CLK_ENABLE, then wait for CLK_OFF to clear (a hardware-gated branch may read off) */
++static bool
++usb_clk_on(vm_offset_t gcc, uint32_t off)
++{
++	uint32_t v = usb_rd(gcc, off);
++	if (!(v & CBCR_ENABLE)) {
++		usb_wr(gcc, off, v | CBCR_ENABLE);
++	}
++	for (int i = 0; i < 200; i++) {
++		v = usb_rd(gcc, off);
++		if (!(v & CBCR_CLK_OFF) || (v & CBCR_HWCG)) {
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET USB: clock CBCR 0x%05x stays off (0x%08x)\n", off, v);
++	return false;
++}
++
++static void
++usb_bcr_pulse(vm_offset_t gcc, uint32_t off, int us)
++{
++	usb_wr(gcc, off, usb_rd(gcc, off) | 1u);
++	delay(us);
++	usb_wr(gcc, off, usb_rd(gcc, off) & ~1u);
++}
++
++static bool
++usb_cold_init(vm_offset_t gcc)
++{
++	/* PMIC5 LDO peripherals 0x4000 + 0x100 * (n - 1): EN_CTL 0x46 bit 7, STATUS1 0x08 bit 7 = ready */
++	static const struct { const char *name; uint16_t ppid; } ldo[] = {
++		{ "L4 vdd", 0x043 }, { "L11 1.8V", 0x04a }, { "L17 3.1V", 0x050 },
++	};
++	for (unsigned i = 0; i < sizeof(ldo) / sizeof(ldo[0]); i++) {
++		uint8_t en = 0, st = 0;
++		int e = sweet_pmic_read(ldo[i].ppid, 0x46, &en) | sweet_pmic_read(ldo[i].ppid, 0x08, &st);
++		printf("SWEET USB: PHY supply %s EN_CTL 0x%02x STATUS1 0x%02x (%d)\n", ldo[i].name, en, st, e);
++	}
++
++	if (!usb_clk_on(gcc, GCC_CLKREF)) {
++		return false;
++	}
++	uint32_t v = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	if (!(v & (1u << 31))) {
++		if (v & (1u << 1)) {            /* HW_CONTROL: gdsc_enable refuses too */
++			printf("SWEET USB: GDSC under hardware control (0x%08x)\n", v);
++			return false;
++		}
++		usb_wr(gcc, GCC_USB30_PRIM_GDSCR, v & ~1u);     /* SW_COLLAPSE off */
++		for (int i = 0; i < 100 && !(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31)); i++) {
++			delay(1);
++		}
++		v = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++		printf("SWEET USB: GDSC on: 0x%08x\n", v);
++		if (!(v & (1u << 31))) {
++			return false;
++		}
++	}
++	usb_bcr_pulse(gcc, GCC_USB30_PRIM_BCR, 1000);
++	delay(200);
++
++	/* core clock: still on XO after reset -> 133.33 MHz (dwc3-msm qcom,core-clk-rate, device mode) =
++	 * GPLL0 main (source 1) / 4.5 (half-integer divider field 8), ftbl_gcc_usb30_prim_master_clk_src */
++	v = usb_rd(gcc, GCC_USB30_MASTER_RCG + 4);
++	if (!(v & (7u << 8))) {
++		usb_wr(gcc, GCC_USB30_MASTER_RCG + 4, (v & ~0x371fu) | (1u << 8) | 8u);
++		usb_wr(gcc, GCC_USB30_MASTER_RCG, usb_rd(gcc, GCC_USB30_MASTER_RCG) | 1u);    /* CMD_UPDATE */
++		for (int i = 0; i < 500 && (usb_rd(gcc, GCC_USB30_MASTER_RCG) & 1u); i++) {
++			delay(1);
++		}
++		printf("SWEET USB: core clock source CMD 0x%08x CFG 0x%08x\n",
++		    usb_rd(gcc, GCC_USB30_MASTER_RCG), usb_rd(gcc, GCC_USB30_MASTER_RCG + 4));
++		if (usb_rd(gcc, GCC_USB30_MASTER_RCG) & 1u) {
++			return false;
++		}
++	}
++	/* sleep, iface (cfg-noc), core (master), utmi, bus_aggr, then the PHY's cfg_ahb */
++	static const uint32_t clk_order[] = { 0x0f014, 0x0502c, 0x0f010, 0x0f018, 0x8201c, 0x6a004 };
++	for (unsigned i = 0; i < sizeof(clk_order) / sizeof(clk_order[0]); i++) {
++		if (!usb_clk_on(gcc, clk_order[i])) {
++			return false;
++		}
++	}
++
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	if (!dwc || !phy || !qs) {
++		return false;
++	}
++	v = usb_rd(dwc, 0xc120);
++	if ((v & 0xffff0000u) != 0x55330000u) {
++		printf("SWEET USB: no DWC3 after reset (GSNPSID 0x%08x)\n", v);
++		return false;
++	}
++	/* dwc3_phy_setup: UTMI 8 bit (PHYIF 0, USBTRDTIM 9), no SUSPHY/ENBLSLPM (DT dis_u2_susphy, dis_enblslpm) */
++	v = usb_rd(dwc, GUSB2PHYCFG);
++	usb_wr(dwc, GUSB2PHYCFG, (v & ~((1u << 3) | (1u << 6) | (1u << 8) | (0xfu << 10))) | (9u << 10));
++
++	/* qusb_phy_init: reset, power down, table, power up, PLL lock after 150 us */
++	usb_bcr_pulse(gcc, GCC_QUSB2PHY_PRIM_BCR, 100);
++	usb_wr(phy, QUSB2_PWR_CTRL1, usb_rd(phy, QUSB2_PWR_CTRL1) | 1u);
++	for (unsigned i = 0; i < sizeof(qusb2_init_seq) / sizeof(qusb2_init_seq[0]); i++) {
++		usb_wr(phy, qusb2_init_seq[i][0], qusb2_init_seq[i][1]);
++	}
++	usb_wr(phy, QUSB2_PWR_CTRL1, usb_rd(phy, QUSB2_PWR_CTRL1) & ~1u);
++	delay(150);
++	v = usb_rd(phy, QUSB2_PLL_STATUS);
++	printf("SWEET USB: QUSB2 PLL_STATUS 0x%02x (%s)\n", v & 0xff, (v & 1u) ? "locked" : "NOT LOCKED");
++
++	/* dwc3_core_setup_global_control + dwc3_set_prtcap: SCALEDOWN 0, port capability device */
++	v = usb_rd(dwc, GCTL);
++	usb_wr(dwc, GCTL, (v & ~((3u << 4) | (3u << 12))) | (2u << 12));
++
++	/* dwc3-msm POST_RESET, maximum-speed high-speed (no SS PHY): PIPE clock from UTMI. Linux does this right
++	 * after the DCTL soft reset; here it comes just before the one sweet_usb_gadget_start() does. */
++	v = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	usb_wr(qs, QSCRATCH_GENERAL_CFG, v | (1u << 8));                /* PIPE_UTMI_CLK_DIS */
++	delay(5);
++	usb_wr(qs, QSCRATCH_GENERAL_CFG, v | (1u << 8) | (1u << 0) | (1u << 3));   /* UTMI_CLK_SEL, PHYSTATUS_SW */
++	delay(5);
++	usb_wr(qs, QSCRATCH_GENERAL_CFG, (v | (1u << 0) | (1u << 3)) & ~(1u << 8));
++	printf("SWEET USB: cold bring-up done: GCTL 0x%08x GUSB2PHYCFG 0x%08x GENERAL_CFG 0x%08x\n",
++	    usb_rd(dwc, GCTL), usb_rd(dwc, GUSB2PHYCFG), usb_rd(qs, QSCRATCH_GENERAL_CFG));
++	return true;
++}
++
+ #define DCTL_RUN_STOP   (1u << 31)
+ #define DCTL_CSFTRST    (1u << 30)
+ #define DSTS_DEVCTRLHLT (1u << 22)

@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index ec57bac..61e9aac 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -4589,12 +4589,6 @@ sm_thread(void *arg, wait_result_t result)
+ 	touch_wait(delay_s * 1000u);
+ 	sm_statfs("when the modem starts");
+ 	sm_probe();
+-	/* 0195: boot-arg sweetbright=<percent> from the UEFI menu's control centre */
+-	int bpct = 0;
+-	if (PE_parse_boot_argn("sweetbright", &bpct, sizeof(bpct)) && bpct >= 1 && bpct <= 100) {
+-		sm_bl_level = bpct * 4095 / 100;
+-		(void)sm_bl_apply((unsigned)sm_bl_level);
+-	}
+ 	int boot = 1;
+ 	(void)PE_parse_boot_argn("sweetmodemstd", &sm_std, sizeof(sm_std));
+ 	(void)PE_parse_boot_argn("sweetmodemboot", &boot, sizeof(boot));
+@@ -4751,6 +4745,13 @@ sweet_modem_start(void)
+ 		PE_halt_restart = sweet_halt_restart;   /* power off / restart from iOS (Settings, slider) */
+ 	}
+ 	sm_rtc_sync();
++	/* 0195: boot-arg sweetbright=<percent> from the UEFI menu's control centre. 0210: here, not in sm_thread, which
++	 * only runs with sweetmodem!=0 (and only 70 s into the boot) */
++	int bpct = 0;
++	if (PE_parse_boot_argn("sweetbright", &bpct, sizeof(bpct)) && bpct >= 1 && bpct <= 100) {
++		sm_bl_level = bpct * 4095 / 100;
++		(void)sm_bl_apply((unsigned)sm_bl_level);
++	}
+ 	miatoll_wifi_init();
+ 	int bl = 0;
+ 	(void)PE_parse_boot_argn("sweetbl", &bl, sizeof(bl));

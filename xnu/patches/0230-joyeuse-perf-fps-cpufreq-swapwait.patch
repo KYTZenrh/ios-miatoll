@@ -1,0 +1,567 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..403a348 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,7 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++extern "C" void sweet_cpufreq_start(void);     /* osfmk/arm64/sweet_cpufreq.c */
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -175,6 +176,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++	sweet_cpufreq_start();
+ 	thread_terminate(current_thread());
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d2e5d71..27c4d2d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -28,7 +28,10 @@
+  * scaling, CPU copy). The panel memory is write-combined (slow to write, much
+  * slower to read), so a cached shadow copy of what the panel holds is kept and
+  * only the pixels that really changed are written (most frames change a small
+- * part of the screen). Vsync (notification type 5) is a 60 Hz timer that
++ * part of the screen). Every sweetfb_stats seconds (default 2, 0 = off) while
++ * frames come in, one "SWEET FPS:" line gives presents/s, swaps/s, frames
++ * replaced before being shown, copy time, changed rows, panel write rate,
++ * vsync callout lateness and SwapWait blocking. Vsync (notification type 5) is a 60 Hz timer that
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+@@ -129,6 +132,16 @@ public:
+ 	bool          fShadowOff;     /* a layer drew into the panel memory directly: the shadow cannot be trusted */
+ 	uint64_t      fVsyncAbs;      /* one vsync period in mach absolute time units */
+ 	uint64_t      fNextVsync;     /* ideal time of the next vsync */
++	/* "SWEET FPS:" line every sweetfb_stats seconds (default 2, 0 = off); times in mach absolute units */
++	uint64_t      fStatPeriod, fStatStart;
++	uint32_t      fStatSwaps, fStatDropped;       /* under fLock */
++	uint32_t      fStatPresents, fStatTicks;      /* vsync thread only, like the rest below */
++	uint64_t      fStatCopy, fStatCopyMax, fStatLate, fStatLateMax;
++	uint64_t      fStatRows, fStatRowsChanged, fStatBytes;
++	bool          fStatShadow;
++	bool          fPipeline;      /* sweetfb_pipeline=1: SwapWait(n) only waits for swap n-1 */
++	uint64_t      fStatWait, fStatWaitMax;        /* SwapWait (client threads): atomic adds, racy max */
++	uint32_t      fStatWaits, fStatWaitsOld, fStatWaitsTimeout;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+@@ -137,6 +150,7 @@ public:
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ 	void rearm(IOTimerEventSource *sender);
++	void statTick(uint64_t now);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -307,6 +321,13 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000ULL, &fVsyncAbs);
+ 	fNextVsync = mach_absolute_time() + fVsyncAbs;
++	int pipeline = 0;
++	PE_parse_boot_argn("sweetfb_pipeline", &pipeline, sizeof(pipeline));
++	fPipeline = pipeline != 0;
++	uint32_t statSecs = 2;
++	PE_parse_boot_argn("sweetfb_stats", &statSecs, sizeof(statSecs));
++	nanoseconds_to_absolutetime((uint64_t)statSecs * NSEC_PER_SEC, &fStatPeriod);
++	fStatStart = mach_absolute_time();
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -337,6 +358,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 * paces its animations from it, and a jittery value shows up as stutter. */
+ 	uint64_t now = fb->fNextVsync;
+ 	uint64_t count = ++fb->fVsyncCount;
++	uint64_t real = mach_absolute_time();
++	uint64_t late = real > now ? real - now : 0;
++
++	fb->statTick(real);
++	fb->fStatTicks++;
++	fb->fStatLate += late;
++	if (late > fb->fStatLateMax) {
++		fb->fStatLateMax = late;
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -358,11 +388,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 		fb->fPresentedSwap = fb->fSwapID;       /* nothing to wait for while off */
+ 		IOLockUnlock(fb->fLock);
++		IOLockWakeup(fb->fLock, (void *)(uintptr_t)&fb->fPresentedSwap, false);
+ 		if (step == 0) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				memset((void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes), 0, (size_t)fb->fWidth * 4);
+ 			}
+-			fb->fShadowValid = false;       /* the panel was written behind the shadow's back */
++			/* The panel is known to be all black: say so in the shadow instead of reading 10 MB of
++			 * uncached panel memory back at the first frame after display on. */
++			if (fb->fShadow != NULL && !fb->fShadowOff) {
++				bzero(fb->fShadow, fb->fShadowSize);
++				fb->fShadowValid = true;
++			} else {
++				fb->fShadowValid = false;
++			}
+ 		}
+ 		fb->rearm(sender);
+ 		return;
+@@ -380,8 +418,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (rec != NULL) {
+ 		uint32_t sid;
+ 		memcpy(&sid, rec + 0x50, sizeof(sid));
++		uint64_t t0 = mach_absolute_time();
+ 		fb->present(rec);
++		uint64_t took = mach_absolute_time() - t0;
++		fb->fStatPresents++;
++		fb->fStatCopy += took;
++		if (took > fb->fStatCopyMax) {
++			fb->fStatCopyMax = took;
++		}
++		/* Under the lock: a SwapWait checks and goes to sleep under it, so this wakeup is never lost. */
++		IOLockLock(fb->fLock);
+ 		fb->fPresentedSwap = sid;
++		IOLockUnlock(fb->fLock);
++		IOLockWakeup(fb->fLock, (void *)(uintptr_t)&fb->fPresentedSwap, false);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	fb->rearm(sender);
+@@ -404,6 +453,50 @@ AppleCLCD::rearm(IOTimerEventSource *sender)
+ 	sender->setTimeoutUS(us < 500 ? 500 : us);
+ }
+ 
++static uint64_t
++sweet_fb_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000ULL;
++}
++
++/* The frame-rate yardstick: one line per period while anything is drawn, nothing while idle. Vsync thread. */
++void
++AppleCLCD::statTick(uint64_t now)
++{
++	if (fStatPeriod == 0 || now - fStatStart < fStatPeriod) {
++		return;
++	}
++	IOLockLock(fLock);
++	uint32_t swaps = fStatSwaps, dropped = fStatDropped;
++	fStatSwaps = fStatDropped = 0;
++	IOLockUnlock(fLock);
++	uint32_t waits = __atomic_exchange_n(&fStatWaits, 0, __ATOMIC_RELAXED);
++	uint32_t waitsOld = __atomic_exchange_n(&fStatWaitsOld, 0, __ATOMIC_RELAXED);
++	uint32_t waitsTimeout = __atomic_exchange_n(&fStatWaitsTimeout, 0, __ATOMIC_RELAXED);
++	uint64_t waitSum = __atomic_exchange_n(&fStatWait, 0, __ATOMIC_RELAXED);
++	uint64_t waitMax = __atomic_exchange_n(&fStatWaitMax, 0, __ATOMIC_RELAXED);
++	uint64_t ms = sweet_fb_us(now - fStatStart) / 1000ULL;
++
++	if ((swaps != 0 || fStatPresents != 0) && ms != 0) {
++		uint64_t p10 = (uint64_t)fStatPresents * 10000ULL / ms, s10 = (uint64_t)swaps * 10000ULL / ms;
++		IOLog("SWEET FPS: %llu.%llu presents/s, swaps %llu.%llu/s, dropped %u, copy avg %llu max %llu us, "
++		    "rows changed %llu%%, panel %llu MB/s, vsync late avg %llu max %llu us (%u ticks), "
++		    "swapwait n %u older %u timeout %u avg %llu max %llu us, shadow %d\n",
++		    p10 / 10, p10 % 10, s10 / 10, s10 % 10, dropped,
++		    fStatPresents ? sweet_fb_us(fStatCopy) / fStatPresents : 0, sweet_fb_us(fStatCopyMax),
++		    fStatRows ? fStatRowsChanged * 100ULL / fStatRows : 0, fStatBytes / 1000ULL / ms,
++		    fStatTicks ? sweet_fb_us(fStatLate) / fStatTicks : 0, sweet_fb_us(fStatLateMax), fStatTicks,
++		    waits, waitsOld, waitsTimeout, waits ? sweet_fb_us(waitSum) / waits : 0, sweet_fb_us(waitMax),
++		    fStatShadow);
++	}
++	fStatPresents = fStatTicks = 0;
++	fStatCopy = fStatCopyMax = fStatLate = fStatLateMax = 0;
++	fStatRows = fStatRowsChanged = fStatBytes = 0;
++	fStatStart = now;
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -443,8 +536,9 @@ sweet_fb_ld64(const uint8_t *p)
+  * Bring `bytes` bytes of one panel row up to date from `src`: only the span between the first and the last 8-byte
+  * word that differs from `shadow` (what the panel holds) is written, to the shadow first and then from the shadow
+  * to the panel, so both always get the same bytes even if the source surface is being drawn into meanwhile.
++ * Returns the number of bytes written to the panel.
+  */
+-static void
++static size_t
+ sweet_fb_row(uint8_t *dst, const uint8_t *src, uint8_t *shadow, size_t bytes)
+ {
+ 	const size_t bulk = bytes & ~(size_t)7;
+@@ -463,7 +557,7 @@ sweet_fb_row(uint8_t *dst, const uint8_t *src, uint8_t *shadow, size_t bytes)
+ 	}
+ 	if (lo == bulk) {
+ 		if (tail == 0 || memcmp(src + bulk, shadow + bulk, tail) == 0) {
+-			return;
++			return 0;
+ 		}
+ 		hi = bytes;
+ 	} else if (tail != 0 && memcmp(src + bulk, shadow + bulk, tail) != 0) {
+@@ -483,6 +577,7 @@ sweet_fb_row(uint8_t *dst, const uint8_t *src, uint8_t *shadow, size_t bytes)
+ 	}
+ 	memcpy(shadow + lo, src + lo, hi - lo);
+ 	memcpy(dst + lo, shadow + lo, hi - lo);
++	return hi - lo;
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
+@@ -500,7 +595,11 @@ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	if (fDirty) {
++		fStatDropped++;         /* the previous frame was never shown */
++	}
+ 	fDirty = true;
++	fStatSwaps++;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+@@ -542,6 +641,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	} else if (!useShadow) {
+ 		fShadowValid = false;
+ 	}
++	fStatShadow = useShadow;
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+@@ -617,12 +717,16 @@ AppleCLCD::present(const uint8_t *rec)
+ 				uint64_t pos = (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4;
+ 				const uint8_t *from = (const uint8_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow +
+ 				    (uint64_t)sx * 4);
++				size_t wrote = (size_t)w * 4;
+ 				if (useShadow) {
+-					sweet_fb_row((uint8_t *)(fPixels + pos), from, fShadow + pos, (size_t)w * 4);
++					wrote = sweet_fb_row((uint8_t *)(fPixels + pos), from, fShadow + pos, (size_t)w * 4);
+ 				} else {
+ 					memcpy((void *)(fPixels + pos), from, (size_t)w * 4);
+ 				}
++				fStatRowsChanged += wrote != 0;
++				fStatBytes += wrote;
+ 			}
++			fStatRows += (uint64_t)h;
+ 		}
+ 		s->release();
+ 	}
+@@ -697,6 +801,7 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ }
+ 
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
++static uint32_t sweet_fb_waits_logged;  /* first SwapWait arguments, to learn which swap CoreAnimation waits for */
+ 
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+@@ -783,9 +888,41 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		 */
+ 		if (args->scalarInputCount >= 1) {
+ 			uint32_t want = (uint32_t)args->scalarInput[0];
+-			for (unsigned i = 0; i < 40 && want != 0 && want <= fFB->fSwapID &&
+-			    (int32_t)(want - fFB->fPresentedSwap) > 0 && !fFB->fPowerOff; i++) {
+-				IOSleep(1);
++			uint32_t latest = fFB->fSwapID;
++			uint64_t t0 = mach_absolute_time();
++			if (sweet_fb_waits_logged < 8) {
++				sweet_fb_waits_logged++;
++				IOLog("SWEET FB: SwapWait in %llu %llu %llu, latest swap %u, presented %u\n",
++				    args->scalarInput[0], args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL,
++				    args->scalarInputCount > 2 ? args->scalarInput[2] : 0ULL, latest, fFB->fPresentedSwap);
++			}
++			/* Woken by the vsync thread the moment the swap is on the panel (was: 1 ms polls, each
++			 * one a timer that may be coalesced and late). */
++			/* sweetfb_pipeline=1: CoreAnimation draws the next frame into its other buffer while this
++			 * one waits for the copy, so only the buffer of the swap before must be off the panel path.
++			 * Off by default: right only if backboardd keeps alternating two or more surfaces. */
++			uint32_t target = fFB->fPipeline ? want - 1 : want;
++			uint64_t deadline;
++			nanoseconds_to_deadline(40 * NSEC_PER_MSEC, &deadline);
++			IOLockLock(fFB->fLock);
++			while (target != 0 && target <= fFB->fSwapID && (int32_t)(target - fFB->fPresentedSwap) > 0 &&
++			    !fFB->fPowerOff && mach_absolute_time() < deadline) {
++				IOLockSleepDeadline(fFB->fLock, (void *)(uintptr_t)&fFB->fPresentedSwap, deadline, THREAD_UNINT);
++			}
++			IOLockUnlock(fFB->fLock);
++			if (want != 0) {
++				uint64_t took = mach_absolute_time() - t0;
++				__atomic_fetch_add(&fFB->fStatWaits, 1, __ATOMIC_RELAXED);
++				__atomic_fetch_add(&fFB->fStatWait, took, __ATOMIC_RELAXED);
++				if (took > __atomic_load_n(&fFB->fStatWaitMax, __ATOMIC_RELAXED)) {
++					__atomic_store_n(&fFB->fStatWaitMax, took, __ATOMIC_RELAXED);
++				}
++				if ((int32_t)(want - latest) < 0) {
++					__atomic_fetch_add(&fFB->fStatWaitsOld, 1, __ATOMIC_RELAXED);
++				}
++				if (target != 0 && target <= latest && (int32_t)(target - fFB->fPresentedSwap) > 0 && !fFB->fPowerOff) {
++					__atomic_fetch_add(&fFB->fStatWaitsTimeout, 1, __ATOMIC_RELAXED);
++				}
+ 			}
+ 		}
+ 		break;
+diff --git a/osfmk/arm64/sweet_cpufreq.c b/osfmk/arm64/sweet_cpufreq.c
+new file mode 100644
+index 0000000..216372c
+--- /dev/null
++++ b/osfmk/arm64/sweet_cpufreq.c
+@@ -0,0 +1,247 @@
++/*
++ * CPU clocks of SM7125 "atoll" (cpu0-5 Cortex-A55 = OSM "pwrcl", cpu6-7 Cortex-A76 = OSM "perfcl").
++ *
++ * Nothing else in this kernel touches the OSM, so the cores run at whatever the boot loader left.
++ * Always (no MMIO, no boot-arg): measure each cluster's real clock with a chain of dependent ADDs
++ * (1 cycle each on A55 and A76) timed by the architected timer, bound to one CPU of the cluster,
++ * interrupts off for < 3 ms; log it at boot and every sweetcpufreq_log seconds (default 30, 0 = once):
++ *   SWEET CPUFREQ: boot: A55 cpu0 1708 MHz (midr 0x51df805e), A76 cpu6 1804 MHz (midr 0x51df804e)
++ *
++ * sweetcpufreq=1 also reads the OSM look-up tables and the LMh limits and asks both clusters for their
++ * highest non-boost perf state; sweetcpufreq=2 also the L3; sweetcpufreq_ro=1 only reads and logs.
++ * The OSM is set up by the boot firmware (voltage, CPR, LMh included): like Linux on atoll
++ * (drivers/clk/qcom/clk-cpu-osm.c, osm_set_index), the OS only writes a LUT index to the
++ * DCVS_PERF_STATE_DESIRED register of each core. The hardware LMh (thermal/current limits, enabled by
++ * firmware on atoll: no qcom,legacy-lmh-enable in the DT) still caps the clock; its current cap is
++ * logged. There is no software thermal governor here: nothing lowers the clock again but LMh.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <stdbool.h>
++#include <stdint.h>
++#include <mach/mach_time.h>
++#include <kern/clock.h>
++#include <kern/cpu_number.h>
++#include <kern/kern_types.h>
++#include <kern/misc_protos.h>
++#include <kern/processor.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <arm/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++void sweet_cpufreq_start(void);
++
++/* dt: qcom,cpucc@18321000 (qcom,clk-cpu-osm-atoll), reg-names osm_l3_base, osm_pwrcl_base, osm_perfcl_base */
++#define OSM_L3_PA               0x18321000ULL
++#define OSM_PWRCL_PA            0x18323000ULL
++#define OSM_PERFCL_PA           0x18325800ULL
++#define OSM_SIZE                0x1400
++#define OSM_TABLE_SIZE          40
++#define OSM_FREQ_REG(i)         (0x110 + 32 * (i))      /* [31:30] source (0: 300 MHz), [18:16] cores, [7:0] x 19.2 MHz */
++#define OSM_VOLT_REG(i)         (0x114 + 32 * (i))      /* [21:16] virtual corner, [11:0] open-loop mV */
++#define OSM_ENABLE_REG          0x0
++#define OSM_CORE_DCVS_CTRL      0xbc                    /* bit 0: one perf-state request per core */
++#define OSM_PERF_STATE(n)       (0x920 + 4 * (n))       /* DCVS_PERF_STATE_DESIRED_REG(core) = LUT index */
++/* dt: qcom,limits-dcvs@18358800 (affinity 0, cpu0-5) and @18350800 (affinity 1, cpu6-7); Linux msm_lmh_dcvs.c */
++#define LMH_SIZE                0x1000
++#define LMH_CAP                 0x704                   /* LIMITS_CLUSTER_REQ_OFFSET: [9:0] x 19.2 MHz */
++
++#define SPIN_ITERS              10000ULL
++#define SPIN_ADDS               64ULL
++
++struct sweet_osm {
++	const char  *name;
++	uint64_t     osm_pa, lmh_pa;
++	unsigned     cores;          /* per-core perf-state registers */
++	bool         per_core;
++	bool         boost_rows;     /* LUT rows for one core only are boost (CPU clusters, not L3) */
++	vm_offset_t  osm, lmh;
++	unsigned     entries, top;
++	uint32_t     top_mhz;
++	int          cpu;            /* a logical CPU of the cluster, -1 = none */
++};
++
++static struct sweet_osm sweet_osm[3] = {
++	{ .name = "A55", .osm_pa = OSM_PWRCL_PA, .lmh_pa = 0x18358800ULL, .cores = 6, .boost_rows = true, .cpu = -1 },
++	{ .name = "A76", .osm_pa = OSM_PERFCL_PA, .lmh_pa = 0x18350800ULL, .cores = 2, .boost_rows = true, .cpu = -1 },
++	{ .name = "L3", .osm_pa = OSM_L3_PA, .cores = 1, .cpu = -1 },
++};
++static int sweet_cpufreq_mode, sweet_cpufreq_ro;
++
++static uint32_t
++rd32(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static void
++wr32(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++}
++
++/* SPIN_ITERS x SPIN_ADDS dependent adds: as many core cycles (+ about 2 % loop overhead on the A55). */
++static void
++sweet_cpufreq_spin(void)
++{
++	uint64_t acc = 0, n = SPIN_ITERS;
++
++	__asm__ volatile (
++                "1:\n"
++                ".rept 64\n"
++                "add %0, %0, #1\n"
++                ".endr\n"
++                "subs %1, %1, #1\n"
++                "b.ne 1b\n"
++                : "+r" (acc), "+r" (n) : : "cc");
++}
++
++/* MHz of `cpu`, best of 3 runs (an interrupt-free run cannot be slower than the clock). */
++static uint32_t
++sweet_cpufreq_measure(int cpu, uint64_t *midr)
++{
++	processor_t p = cpu >= 0 ? cpu_to_processor(cpu) : PROCESSOR_NULL;
++	uint32_t best = 0;
++
++	*midr = 0;
++	if (p == PROCESSOR_NULL) {
++		return 0;
++	}
++	thread_bind(p);
++	thread_block(THREAD_CONTINUE_NULL);
++	if (cpu_number() == cpu) {
++		*midr = __builtin_arm_rsr64("MIDR_EL1");
++		for (int run = 0; run < 3; run++) {
++			boolean_t istate = ml_set_interrupts_enabled(FALSE);
++			uint64_t t0 = mach_absolute_time();
++			sweet_cpufreq_spin();
++			uint64_t t1 = mach_absolute_time();
++			ml_set_interrupts_enabled(istate);
++			uint64_t ns;
++			absolutetime_to_nanoseconds(t1 - t0, &ns);
++			uint32_t mhz = ns != 0 ? (uint32_t)(SPIN_ITERS * SPIN_ADDS * 1000ULL / ns) : 0;
++			if (mhz > best) {
++				best = mhz;
++			}
++		}
++	}
++	thread_bind(PROCESSOR_NULL);
++	thread_block(THREAD_CONTINUE_NULL);
++	return best;
++}
++
++static void
++sweet_cpufreq_report(const char *when)
++{
++	uint64_t m0, m1;
++	uint32_t a55 = sweet_cpufreq_measure(sweet_osm[0].cpu, &m0);
++	uint32_t a76 = sweet_cpufreq_measure(sweet_osm[1].cpu, &m1);
++
++	printf("SWEET CPUFREQ: %s: A55 cpu%d %u MHz (midr 0x%llx), A76 cpu%d %u MHz (midr 0x%llx)\n",
++	    when, sweet_osm[0].cpu, a55, m0, sweet_osm[1].cpu, a76, m1);
++	if (sweet_osm[0].osm != 0 && sweet_osm[1].osm != 0) {
++		printf("SWEET CPUFREQ: %s: LMh cap A55 %u MHz A76 %u MHz, perf state A55 %u/%u A76 %u/%u L3 %u/%u\n", when,
++		    (rd32(sweet_osm[0].lmh + LMH_CAP) & 0x3ff) * 192 / 10, (rd32(sweet_osm[1].lmh + LMH_CAP) & 0x3ff) * 192 / 10,
++		    rd32(sweet_osm[0].osm + OSM_PERF_STATE(0)), sweet_osm[0].top,
++		    rd32(sweet_osm[1].osm + OSM_PERF_STATE(0)), sweet_osm[1].top,
++		    sweet_osm[2].osm != 0 ? rd32(sweet_osm[2].osm + OSM_PERF_STATE(0)) : 0, sweet_osm[2].top);
++	}
++}
++
++/* Read one OSM look-up table (Linux clk_osm_read_lut / osm_cpufreq_cpu_init): two equal rows end it. */
++static void
++sweet_cpufreq_lut(struct sweet_osm *c)
++{
++	uint32_t prev = 0;
++
++	c->osm = ml_io_map(c->osm_pa, OSM_SIZE);
++	if (c->lmh_pa != 0) {
++		c->lmh = ml_io_map(c->lmh_pa, LMH_SIZE);
++	}
++	c->per_core = c->cores > 1 && (rd32(c->osm + OSM_CORE_DCVS_CTRL) & 1) != 0;
++	for (unsigned i = 0; i < OSM_TABLE_SIZE; i++) {
++		uint32_t f = rd32(c->osm + OSM_FREQ_REG(i));
++		uint32_t v = rd32(c->osm + OSM_VOLT_REG(i));
++		uint32_t mhz = (f >> 30) != 0 ? (f & 0xff) * 192 / 10 : 300;
++		unsigned cores = (f >> 16) & 7;
++
++		if (i > 0 && mhz == prev) {
++			break;
++		}
++		printf("SWEET CPUFREQ: %s lut %u: %u MHz, cores %u, corner %u, %u mV (raw 0x%08x 0x%08x)\n",
++		    c->name, i, mhz, cores, (v >> 16) & 0x3f, v & 0xfff, f, v);
++		c->entries = i + 1;
++		if (!c->boost_rows || cores != 1) {     /* one-core rows are boost: Linux leaves them out by default */
++			c->top = i;
++			c->top_mhz = mhz;
++		}
++		prev = mhz;
++	}
++	printf("SWEET CPUFREQ: %s: %u rows, top non-boost row %u = %u MHz, per-core requests %d, now at row %u\n",
++	    c->name, c->entries, c->top, c->top_mhz, c->per_core, rd32(c->osm + OSM_PERF_STATE(0)));
++}
++
++static void
++sweet_cpufreq_raise(struct sweet_osm *c)
++{
++	/* A table that does not look like one (unreadable, all zero) would make "top" a low row: never go down. */
++	if (c->entries < 4 || c->top_mhz < 1000 || rd32(c->osm + OSM_PERF_STATE(0)) >= c->top) {
++		printf("SWEET CPUFREQ: %s: left alone\n", c->name);
++		return;
++	}
++	for (unsigned n = 0; n < (c->per_core ? c->cores : 1); n++) {
++		wr32(c->osm + OSM_PERF_STATE(n), c->top);
++	}
++	(void)rd32(c->osm + OSM_ENABLE_REG);    /* Linux clk_osm_mb: the write is through */
++	printf("SWEET CPUFREQ: %s: requested row %u (%u MHz)\n", c->name, c->top, c->top_mhz);
++}
++
++static void
++sweet_cpufreq_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	uint32_t period = 30;
++
++	PE_parse_boot_argn("sweetcpufreq", &sweet_cpufreq_mode, sizeof(sweet_cpufreq_mode));
++	PE_parse_boot_argn("sweetcpufreq_ro", &sweet_cpufreq_ro, sizeof(sweet_cpufreq_ro));
++	PE_parse_boot_argn("sweetcpufreq_log", &period, sizeof(period));
++	/* MPIDR Aff1 0-5 = A55, 6-7 = A76 (SweetCPU.cpp) */
++	for (unsigned i = 0; i < topology->num_cpus; i++) {
++		struct sweet_osm *c = &sweet_osm[topology->cpus[i].phys_id >= 0x600 ? 1 : 0];
++		if (c->cpu < 0) {
++			c->cpu = (int)topology->cpus[i].cpu_id;
++		}
++	}
++	if (sweet_cpufreq_mode > 0) {
++		sweet_cpufreq_lut(&sweet_osm[0]);
++		sweet_cpufreq_lut(&sweet_osm[1]);
++		sweet_cpufreq_lut(&sweet_osm[2]);
++	}
++	sweet_cpufreq_report("boot");
++	if (sweet_cpufreq_mode > 0 && !sweet_cpufreq_ro) {
++		sweet_cpufreq_raise(&sweet_osm[0]);
++		sweet_cpufreq_raise(&sweet_osm[1]);
++		if (sweet_cpufreq_mode > 1) {
++			sweet_cpufreq_raise(&sweet_osm[2]);
++		}
++		delay_for_interval(50, (uint32_t)NSEC_PER_MSEC);
++		sweet_cpufreq_report("raised");
++	}
++	while (period != 0) {
++		delay_for_interval(period * 1000, (uint32_t)NSEC_PER_MSEC);
++		sweet_cpufreq_report("now");
++	}
++}
++
++void
++sweet_cpufreq_start(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(sweet_cpufreq_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* SWEET */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index b0dad49..34a3125 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -41,6 +41,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/sweet_cpufreq.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard

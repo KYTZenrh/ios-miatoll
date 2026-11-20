@@ -1,0 +1,128 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index 61e9aac..dd3963c 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -12,6 +12,8 @@
+ #include <mach/vm_param.h>
+ #include <vm/vm_kern.h>
+ #include <arm/caches_internal.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define SM_SVC_INFO     0x6u
+@@ -4479,8 +4481,11 @@ sm_rtc_sync(void)
+ 	}
+ }
+ 
++static int sm_bl_written = -1;  /* last level written to the WLED (0211: iOS updates skip repeats) */
++static int sm_bl_quiet;         /* 1: the caller logs (iOS brightness updates come in bursts) */
++
+ static int
+-sm_bl_apply(unsigned level)
++sm_bl_apply_unlocked(unsigned level)
+ {
+ 	if (!sp_wled_apid || sp_wled_apid == SP_NO_APID) {
+ 		if (sp_init()) {
+@@ -4515,11 +4520,28 @@ sm_bl_apply(unsigned level)
+ 	if (!e) {
+ 		e = sp_write(sp_wled_apid, 0x65, 0, 1);
+ 	}
+-	printf("SWEET BL: level %u -> %d\n", level, e);
++	sm_bl_written = e ? -1 : (int)level;
++	if (e || !sm_bl_quiet) {
++		printf("SWEET BL: level %u -> %d\n", level, e);
++	}
+ 	return e ? EIO : 0;
+ }
+ 
++/* 0211: one WLED writer at a time (display power, iOS brightness thread call, sysctl, boot-arg) */
++static LCK_GRP_DECLARE(sm_bl_grp, "sweet_bl");
++static LCK_MTX_DECLARE(sm_bl_mtx, &sm_bl_grp);
++
++static int
++sm_bl_apply(unsigned level)
++{
++	lck_mtx_lock(&sm_bl_mtx);
++	int e = sm_bl_apply_unlocked(level);
++	lck_mtx_unlock(&sm_bl_mtx);
++	return e;
++}
++
+ static int sm_bl_level = 1072;
++static int sm_bl_on = 1;        /* 0: display off with sweetblsleep=1 (backlight held at 0) */
+ 
+ /* the LCD's backlight follows the display power (SweetFramebuffer): black pixels alone still glow on miatoll */
+ void sweet_backlight_power(int on);
+@@ -4534,8 +4556,62 @@ sweet_backlight_power(int on)
+ 		(void)PE_parse_boot_argn("sweetblsleep", &enabled, sizeof(enabled));
+ 	}
+ 	if (enabled) {
+-		(void)sm_bl_apply(on ? (unsigned)sm_bl_level : 0);
++		lck_mtx_lock(&sm_bl_mtx);
++		sm_bl_on = on;
++		(void)sm_bl_apply_unlocked(on ? (unsigned)sm_bl_level : 0);
++		lck_mtx_unlock(&sm_bl_mtx);
++	}
++}
++
++/*
++ * 0211: the iOS brightness (SweetFramebuffer.cpp, from backboardd's property writes). CoreBrightness ramps the
++ * level in many small steps: they are coalesced into one WLED write per SM_BL_IOS_MS, from a thread call (never
++ * from the caller's thread, never while the display is off with sweetblsleep=1).
++ */
++#define SM_BL_MIN       40      /* ~1% of the WLED current: dim but never dark while the display is on */
++#define SM_BL_IOS_MS    30
++
++static thread_call_t sm_bl_call;
++static int sm_bl_pending;
++static unsigned sm_bl_ios_count;
++
++static void
++sm_bl_ios_apply(thread_call_param_t p0, thread_call_param_t p1)
++{
++#pragma unused(p0, p1)
++	lck_mtx_lock(&sm_bl_mtx);
++	sm_bl_pending = 0;
++	int level = sm_bl_level;
++	if (sm_bl_on && level != sm_bl_written) {
++		sm_bl_quiet = 1;
++		int e = sm_bl_apply_unlocked((unsigned)level);
++		sm_bl_quiet = 0;
++		if (++sm_bl_ios_count <= 16 || (sm_bl_ios_count % 32) == 0 || e) {
++			printf("SWEET BL: iOS level %d -> %d (update %u)\n", level, e, sm_bl_ios_count);
++		}
++	}
++	lck_mtx_unlock(&sm_bl_mtx);
++}
++
++void sweet_backlight_set(int level);
++void
++sweet_backlight_set(int level)
++{
++	if (level < SM_BL_MIN) {
++		level = SM_BL_MIN;
++	}
++	if (level > 4095) {
++		level = 4095;
++	}
++	lck_mtx_lock(&sm_bl_mtx);
++	sm_bl_level = level;            /* also the level the next display on restores */
++	if (sm_bl_call != NULL && !sm_bl_pending) {
++		uint64_t deadline;
++		sm_bl_pending = 1;
++		clock_interval_to_deadline(SM_BL_IOS_MS, NSEC_PER_MSEC, &deadline);
++		(void)thread_call_enter_delayed(sm_bl_call, deadline);
+ 	}
++	lck_mtx_unlock(&sm_bl_mtx);
+ }
+ 
+ static int
+@@ -4745,6 +4821,7 @@ sweet_modem_start(void)
+ 		PE_halt_restart = sweet_halt_restart;   /* power off / restart from iOS (Settings, slider) */
+ 	}
+ 	sm_rtc_sync();
++	sm_bl_call = thread_call_allocate(sm_bl_ios_apply, NULL);
+ 	/* 0195: boot-arg sweetbright=<percent> from the UEFI menu's control centre. 0210: here, not in sm_thread, which
+ 	 * only runs with sweetmodem!=0 (and only 70 s into the boot) */
+ 	int bpct = 0;

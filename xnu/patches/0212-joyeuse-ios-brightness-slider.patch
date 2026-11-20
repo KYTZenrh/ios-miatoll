@@ -1,0 +1,105 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 31c8b48..d2e5d71 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -55,6 +55,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <sys/proc.h>
+ 
+ extern "C" void sweet_backlight_power(int on);   /* bsd/dev/sweet_modem.inc: LCD backlight off with the display */
++extern "C" void sweet_backlight_set(int level);  /* bsd/dev/sweet_modem.inc: WLED level 0..4095 (clamped, coalesced) */
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -130,6 +131,7 @@ public:
+ 	uint64_t      fNextVsync;     /* ideal time of the next vsync */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -139,6 +141,66 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/*
++ * 0212: iOS brightness. backboardd (CoreBrightness) looks once for a service with backlight-control = true
++ * ("IOK backboardd: matching ... backlight-control ... -> 0 found"); the iPhone X kernelcache matches its
++ * AppleARMBacklight on exactly that, and backboardd's sandbox lets it set brightness-nits, DisplayBrightness* on
++ * AppleARMBacklight and IOMFBBrightnessLevel (IOFixed 16.16 nits) on AppleCLCD. Both nits keys are taken as 16.16
++ * nits, linear to the WLED current; every key backboardd sets is logged so the real protocol shows in the log.
++ */
++#define SWEET_BL_MAX_NITS               500     /* iPhone X SDR maximum -> full WLED current */
++
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++static uint32_t sweet_bl_props_count;
++
++static IOReturn
++sweet_bl_set_properties(const char *who, OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	const char *pname = name;       /* a block cannot capture the array */
++	uint32_t n = ++sweet_bl_props_count;
++	bool verbose = n <= 64 || (n % 64) == 0;
++	IOReturn ret __block = kIOReturnUnsupported;
++	dict->iterateObjects(^bool (const OSSymbol *key, OSObject *value) {
++		OSNumber *num = OSDynamicCast(OSNumber, value);
++		if (verbose) {
++			IOLog("SWEET BL: %s sets %s %s = %s 0x%llx (#%u)\n", pname, who, key->getCStringNoCopy(),
++			    value->getMetaClass()->getClassName(), num != NULL ? num->unsigned64BitValue() : 0ULL, n);
++		}
++		if (num != NULL && (key->isEqualTo("IOMFBBrightnessLevel") || key->isEqualTo("brightness-nits"))) {
++			uint64_t level = num->unsigned64BitValue() * 4095ULL / ((uint64_t)SWEET_BL_MAX_NITS << 16);
++			sweet_backlight_set(level > 4095 ? 4095 : (int)level);
++			ret = kIOReturnSuccess;
++		}
++		return false;
++	});
++	return ret;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	return sweet_bl_set_properties("AppleARMBacklight", properties);
++}
++
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	return sweet_bl_set_properties("AppleCLCD", properties);
++}
++
+ static AppleCLCD *gSweetCLCD;           /* the panel, for sweet_fb_show() */
+ 
+ /* RedwoodGPU's kRedwoodShow: a test's pixels (32 bits, blue first) at the panel's top left. */
+@@ -251,6 +313,17 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	/* 0212: the backlight service backboardd looks for; boot-arg sweetblnub=0 leaves it out */
++	int blnub = 1;
++	PE_parse_boot_argn("sweetblnub", &blnub, sizeof(blnub));
++	AppleARMBacklight *bl = blnub ? OSTypeAlloc(AppleARMBacklight) : NULL;
++	if (bl != NULL && bl->init() && bl->attach(this)) {
++		bl->setName("backlight");
++		bl->setProperty("backlight-control", true);
++		bl->registerService();
++		IOLog("SWEET BL: AppleARMBacklight published\n");
++	}
++	OSSafeReleaseNULL(bl);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
