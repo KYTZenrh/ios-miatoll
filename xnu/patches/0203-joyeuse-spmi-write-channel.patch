@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
 --- a/bsd/dev/sweet_modem.inc	2026-11-20 17:47:58.008809000 +0200
-+++ b/bsd/dev/sweet_modem.inc	2026-11-20 17:48:48.097141300 +0200
-@@ -4213,7 +4213,12 @@
++++ b/bsd/dev/sweet_modem.inc	2026-11-20 18:34:13.236366000 +0200
+@@ -4213,10 +4213,15 @@
  /* ---- backlight: PM6150L WLED5 modulator A through the SPMI arbiter (writes need the apps-owned channel) ---- */
  #define SP_CORE_PA      0x0c440000ULL
  #define SP_CNFG_PA      0x0c40a000ULL
@@ -10,12 +10,15 @@ diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
 + * Linux spmi-pmic-arb pmic_arb_offset_v5: PMIC_ARB_CHANNEL_RW = 0x10000 * apid). The old 0x0e400000 has nothing
 + * behind it on joyeuse: the first access stalled the bus and froze the phone (v2 backlight, remote reboot). */
 +#define SP_CHNL_PA      0x0c600000ULL
-+#define SP_CHNL_SIZE    0x02000000ULL
 +#define SP_APIDS        512u
  #define SP_NO_APID      0xffffu
  
  static vm_offset_t sp_core, sp_cnfg, sp_chnl;
-@@ -4239,7 +4244,16 @@
++static vm_offset_t sp_chnl_page[SP_APIDS];
+ static uint16_t sp_wled_apid = 0;
+ 
+ static uint16_t
+@@ -4239,7 +4244,23 @@
  static int
  sp_write(uint16_t apid, uint8_t addr, uint32_t data, unsigned n)
  {
@@ -29,20 +32,27 @@ diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
 +		printf("SWEET SPMI: write to apid %#x refused (owner EE %u)\n", apid, owner);
 +		return EPERM;
 +	}
-+	vm_offset_t ch = sp_chnl + 0x10000u * apid;
++	/* map only this APID's channel page, on first use: one 32 MiB ml_io_map of all channels panicked the kernel */
++	if (!sp_chnl_page[apid]) {
++		sp_chnl_page[apid] = ml_io_map(SP_CHNL_PA + 0x10000ull * apid, 0x1000);
++		if (!sp_chnl_page[apid]) {
++			return ENOMEM;
++		}
++	}
++	vm_offset_t ch = sp_chnl_page[apid];
  	sm_w32(ch + 0x10, data);
  	__asm__ volatile("dsb sy" : : : "memory");
  	sm_w32(ch, ((uint32_t)addr << 4) | (n - 1));      /* EXT_WRITEL */
-@@ -4262,7 +4276,7 @@
+@@ -4262,7 +4283,7 @@
  	if (!sp_core) {
  		sp_core = ml_io_map(SP_CORE_PA, 0x2000);
  		sp_cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
 -		sp_chnl = ml_io_map(SP_CHNL_PA, 0x10000);
-+		sp_chnl = ml_io_map(SP_CHNL_PA, SP_CHNL_SIZE);
++		sp_chnl = ml_io_map(SP_CHNL_PA, 0x1000);
  		sp_obs = ml_io_map(SP_OBS_PA, 0x10000);
  		if (!sp_core || !sp_cnfg || !sp_chnl || !sp_obs) {
  			sp_core = 0;
-@@ -4470,6 +4484,12 @@
+@@ -4470,6 +4491,12 @@
  			sp_wled_apid = sp_find_apid(0x4d9);
  		}
  		printf("SWEET BL: WLED sink apid %#x\n", sp_wled_apid);
