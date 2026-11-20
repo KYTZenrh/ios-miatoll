@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index ec57bac..310fed2 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -4624,7 +4624,7 @@ static void
+ sweet_reboot_bootloader(void)
+ {
+ 	/* the two places the Android kernel leaves "reboot bootloader" for the boot chain: IMEM restart reason
+-	 * and PM6150 PON_SOFT_RB_SPARE (reason 2 << 2) */
++	 * and PM6150 PON_SOFT_RB_SPARE (reason 2). ABL never reads misc "bootonce-bootloader" (no such string in it). */
+ 	printf("SWEET RESET: start\n");
+ 	if (!sm_reboot_nomodem) {
+ 		sm_modem_shutdown();
+@@ -4640,9 +4640,16 @@ sweet_reboot_bootloader(void)
+ 	if (!sm_reboot_plain && !sp_init()) {
+ 		uint16_t apid = sp_find_apid(0x008);
+ 		uint8_t old = 0;
+-		if (apid != SP_NO_APID && !sp_read(apid, 0x8f, &old)) {
+-			int e = sp_write(apid, 0x8f, (old & 3u) | (2u << 2), 1);
+-			printf("SWEET RESET: PON spare %#x -> %#x (%d)\n", old, (old & 3u) | (2u << 2), e);
++		uint8_t subtype = 0, now = 0;
++		if (apid != SP_NO_APID && !sp_read(apid, 0x05, &subtype) && !sp_read(apid, 0x8f, &old)) {
++			/* 0220: Linux qpnp_pon_set_restart_reason: a GEN2 PON (subtype 4/5, expected on PM6150) keeps the reason in
++			 * bits 7:1, older PONs in 7:2. 2 << 2 on PM6150 read back as reason 4 (dm-verity), which ABL
++			 * ignores and boots normally; ABL's FASTBOOT_MODE is reason 2. */
++			unsigned shift = (subtype == 4 || subtype == 5) ? 1 : 2;
++			uint8_t val = (uint8_t)((old & ((1u << shift) - 1)) | (2u << shift));
++			int e = sp_write(apid, 0x8f, val, 1);
++			(void)sp_read(apid, 0x8f, &now);
++			printf("SWEET RESET: PON subtype %u, spare %#x -> %#x (%d), reads %#x\n", subtype, old, val, e, now);
+ 		}
+ 	}
+ 	printf("SWEET RESET: restarting into the bootloader\n");
