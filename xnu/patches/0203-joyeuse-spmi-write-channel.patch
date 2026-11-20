@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+--- a/bsd/dev/sweet_modem.inc	2026-11-20 17:47:58.008809000 +0200
++++ b/bsd/dev/sweet_modem.inc	2026-11-20 17:48:48.097141300 +0200
+@@ -4213,7 +4213,12 @@
+ /* ---- backlight: PM6150L WLED5 modulator A through the SPMI arbiter (writes need the apps-owned channel) ---- */
+ #define SP_CORE_PA      0x0c440000ULL
+ #define SP_CNFG_PA      0x0c40a000ULL
+-#define SP_CHNL_PA      0x0e400000ULL
++/* "chnls" in the live DT (qcom,spmi@c440000 reg-names): 32 MiB, one 64 KiB write channel per APID (arbiter v5,
++ * Linux spmi-pmic-arb pmic_arb_offset_v5: PMIC_ARB_CHANNEL_RW = 0x10000 * apid). The old 0x0e400000 has nothing
++ * behind it on joyeuse: the first access stalled the bus and froze the phone (v2 backlight, remote reboot). */
++#define SP_CHNL_PA      0x0c600000ULL
++#define SP_CHNL_SIZE    0x02000000ULL
++#define SP_APIDS        512u
+ #define SP_NO_APID      0xffffu
+ 
+ static vm_offset_t sp_core, sp_cnfg, sp_chnl;
+@@ -4239,7 +4244,16 @@
+ static int
+ sp_write(uint16_t apid, uint8_t addr, uint32_t data, unsigned n)
+ {
+-	vm_offset_t ch = sp_chnl + 0x80u * apid;
++	if (apid >= SP_APIDS || n < 1 || n > 4) {
++		return EINVAL;
++	}
++	/* only channels the apps processor (EE 0, qcom,ee in the DT) owns; another owner's channel faults the bus */
++	uint32_t owner = sm_r32(sp_cnfg + 0x700u + 4u * apid) & 7u;
++	if (owner != 0) {
++		printf("SWEET SPMI: write to apid %#x refused (owner EE %u)\n", apid, owner);
++		return EPERM;
++	}
++	vm_offset_t ch = sp_chnl + 0x10000u * apid;
+ 	sm_w32(ch + 0x10, data);
+ 	__asm__ volatile("dsb sy" : : : "memory");
+ 	sm_w32(ch, ((uint32_t)addr << 4) | (n - 1));      /* EXT_WRITEL */
+@@ -4262,7 +4276,7 @@
+ 	if (!sp_core) {
+ 		sp_core = ml_io_map(SP_CORE_PA, 0x2000);
+ 		sp_cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
+-		sp_chnl = ml_io_map(SP_CHNL_PA, 0x10000);
++		sp_chnl = ml_io_map(SP_CHNL_PA, SP_CHNL_SIZE);
+ 		sp_obs = ml_io_map(SP_OBS_PA, 0x10000);
+ 		if (!sp_core || !sp_cnfg || !sp_chnl || !sp_obs) {
+ 			sp_core = 0;
+@@ -4470,6 +4484,12 @@
+ 			sp_wled_apid = sp_find_apid(0x4d9);
+ 		}
+ 		printf("SWEET BL: WLED sink apid %#x\n", sp_wled_apid);
++		if (sp_wled_apid != SP_NO_APID) {
++			/* the level the bootloader left (12-bit vs 15-bit range check) and modulator A enable, read-only */
++			uint8_t lsb = 0, msb = 0, en = 0;
++			int r = sp_read(sp_wled_apid, 0x53, &lsb) | sp_read(sp_wled_apid, 0x54, &msb) | sp_read(sp_wled_apid, 0x50, &en);
++			printf("SWEET BL: before: brightness %#x (lsb %#x msb %#x) mod_a_en %#x read %d\n", (msb << 8) | lsb, lsb, msb, en, r);
++		}
+ 	}
+ 	if (sp_wled_apid == SP_NO_APID) {
+ 		return ENODEV;
