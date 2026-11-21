@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index 895a4e4..9fda958 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -2966,6 +2966,19 @@ static unsigned
+ wl_ce_poll(void)
+ {
+ 	unsigned got = 0;
++	/*
++	 * 0256: every Wi-Fi wait loop (scan, workbench, HTT setup) polls only here, so the modem's QRTR traffic (glink) and the
++	 * smp2p state were not serviced after FW_READY: the PDR "wlan_pd DOWN" indication went unacknowledged and the modem died
++	 * with "servreg_monitor.c: Servreg ack timedout: msm/modem/wlan_pd" (wl diag, SMEM 421), and any QMI/TFTP request of the
++	 * WLAN firmware during the scan went unanswered.
++	 */
++	static int in_gl;
++	if (!in_gl) {
++		in_gl = 1;
++		gl_poll();
++		sm_smp2p_poll();
++		in_gl = 0;
++	}
+ 	for (unsigned i = 0; i < WL_CE_NUM; ++i) {
+ 		if (!wl.ce[i].dst) {
+ 			continue;
