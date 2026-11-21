@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index 9fda958..97f8b1e 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -2820,7 +2820,7 @@ wl_w(uint32_t off, uint32_t v)
+  * so it needs no cache maintenance. Boot-arg wllow=0 goes back to XNU pages.
+  */
+ #define WL_LOW_PA       0xe0000000ULL
+-#define WL_LOW_SIZE     0x100000u
++#define WL_LOW_SIZE     0x800000u      /* 0257: room for the 2048-buffer ring (4 MiB) */
+ static vm_offset_t wl_low_va;
+ static int wl_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+@@ -3719,7 +3719,8 @@ wl_service(void)
+  * 360 bytes; offsets in 4-byte words computed from ath10k's own structs). Without host buffers the firmware has nowhere to put
+  * received frames. HTT goes out on CE4; answers (RX_IN_ORD_PADDR_IND and friends) come in on CE1 and are logged as "endpoint N".
+  */
+-#define WL_HTT_RING_N   128u
++#define WL_HTT_RING_N   2048u   /* 0257: ath10k HTT_RX_RING_SIZE (was 128) */
++#define WL_HTT_FILL     (WL_HTT_RING_N - 1)     /* 0257: WCN3990 is dual-MAC: HTT_RX_RING_FILL_LEVEL_DUAL_MAC (was size / 2 - 1) */
+ #define WL_HTT_BUF_SZ   2048u
+ static vm_offset_t wl_htt_ring, wl_htt_bufs, wl_htt_idx, wl_htt_txb, wl_htt_frag;
+ static uint64_t wl_htt_ring_pa, wl_htt_bufs_pa, wl_htt_idx_pa, wl_htt_txb_pa, wl_htt_frag_pa;
+@@ -3850,13 +3851,13 @@ wl_htt_rx_setup(void)
+ 		return ENOENT;
+ 	}
+ 	if (!wl_htt_ring) {
+-		if (wl_alloc_low(0x1000, &wl_htt_ring, &wl_htt_ring_pa) || wl_alloc_low(WL_HTT_RING_N * WL_HTT_BUF_SZ, &wl_htt_bufs, &wl_htt_bufs_pa) ||
++		if (wl_alloc_low(WL_HTT_RING_N * 8u, &wl_htt_ring, &wl_htt_ring_pa) || wl_alloc_low(WL_HTT_RING_N * WL_HTT_BUF_SZ, &wl_htt_bufs, &wl_htt_bufs_pa) ||
+ 		    wl_alloc_low(0x1000, &wl_htt_idx, &wl_htt_idx_pa) || wl_alloc_low(0x1000, &wl_htt_txb, &wl_htt_txb_pa)) {
+ 			wl_htt_ring = 0;
+ 			return ENOMEM;
+ 		}
+ 		uint64_t *r = (uint64_t *)wl_htt_ring;
+-		uint32_t fill = WL_HTT_RING_N / 2 - 1;          /* HTT_RX_RING_FILL_LEVEL */
++		uint32_t fill = WL_HTT_FILL;          /* HTT_RX_RING_FILL_LEVEL */
+ 		for (uint32_t i = 0; i < fill; ++i) {
+ 			r[i] = wl_htt_bufs_pa + (uint64_t)i * WL_HTT_BUF_SZ;
+ 		}
+@@ -3906,7 +3907,7 @@ wl_htt_rx_setup(void)
+ 	memcpy(m + 4, &a64, 8);                                 /* fw_idx_shadow_reg_paddr */
+ 	memcpy(m + 12, &b64, 8);                                /* rx_ring_base_paddr */
+ 	uint16_t f[10] = {
+-		WL_HTT_RING_N, WL_HTT_BUF_SZ, 0xffff, (uint16_t)(WL_HTT_RING_N / 2 - 1),   /* len, bufsize, flags (all), fw_idx_init_val */
++		WL_HTT_RING_N, WL_HTT_BUF_SZ, 0xffff, (uint16_t)(WL_HTT_FILL),   /* len, bufsize, flags (all), fw_idx_init_val */
+ 		74, 90, 27, 37, 4, 26                           /* mac80211 hdr, msdu payload, ppdu start/end, mpdu start/end */
+ 	};
+ 	uint16_t g[4] = {7, 12, 1, 2};                          /* msdu start, msdu end, rx attention, frag info */
+@@ -3914,7 +3915,7 @@ wl_htt_rx_setup(void)
+ 	memcpy(m + 40, g, sizeof(g));
+ 	int e2 = wl_htt_send(m, 48);
+ 	printf("SWEET HTT: version request error %d, frag bank error %d, rx ring cfg error %d (ring %#llx idx %#llx, %u buffers of %u)\n", e1, e0, e2,
+-	    (unsigned long long)wl_htt_ring_pa, (unsigned long long)wl_htt_idx_pa, WL_HTT_RING_N / 2 - 1, WL_HTT_BUF_SZ);
++	    (unsigned long long)wl_htt_ring_pa, (unsigned long long)wl_htt_idx_pa, WL_HTT_FILL, WL_HTT_BUF_SZ);
+ 	for (unsigned ms = 0; ms < 500; ms += 10) {
+ 		wl_ce_poll();
+ 		touch_wait(10);
+@@ -4024,7 +4025,7 @@ wl_wmi_bringup(void)
+ 			}
+ 		}
+ 		printf("SWEET HTT: rx ring idx %u of %u, %u slots rewritten, %u buffers with data\n",
+-		    *(volatile uint32_t *)wl_htt_idx, WL_HTT_RING_N / 2 - 1, moved, filled);
++		    *(volatile uint32_t *)wl_htt_idx, WL_HTT_FILL, moved, filled);
+ 	}
+ 	{
+ 		uint32_t dbg = 0;
