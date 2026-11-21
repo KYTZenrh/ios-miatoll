@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index fd90b31..895a4e4 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -3650,6 +3650,34 @@ wl_do_cmd(const char *c)
+ 			n += (size_t)snprintf(wl_last + n, sizeof(wl_last) - n, "%#x:%u ", wl_ev_id[k], wl_ev_cnt[k]);
+ 		}
+ 		snprintf(wl_last + n, sizeof(wl_last) - n, "\n");
++	} else if (strncmp(c, "diag", 4) == 0) {
++		/*
++		 * 0255: why does the target die once frames flow? SMMU global fault + context bank 0 (the shared bypass bank the WLAN
++		 * stream uses; banks start at 128 pages: IDR1 NUMPAGENDXB 6, 4 KiB pages), the smp2p state (fatal bit -> crash reason)
++		 * and SMEM item 421 (the Q6's crash reason text) read now, whatever the smp2p bit says.
++		 */
++		static vm_offset_t gs, cb0;
++		if (!gs) {
++			gs = ml_io_map(SMMU_PA, 0x1000);
++			cb0 = ml_io_map(SMMU_PA + 0x80000, 0x1000);
++		}
++		sm_smp2p_poll();
++		uint32_t gf = gs ? sm_r32(gs + 0x48) : 0, gy0 = gs ? sm_r32(gs + 0x50) : 0, gy1 = gs ? sm_r32(gs + 0x54) : 0;
++		uint32_t fsr = cb0 ? sm_r32(cb0 + 0x58) : 0, fal = cb0 ? sm_r32(cb0 + 0x60) : 0, fah = cb0 ? sm_r32(cb0 + 0x64) : 0;
++		uint32_t fsy = cb0 ? sm_r32(cb0 + 0x68) : 0;
++		uint32_t rsz = 0;
++		vm_offset_t r = sm_smem_item(SM_HOST_GLOBAL, 421, &rsz);
++		char why[120];
++		uint32_t k = 0;
++		for (; r && k < rsz && k + 1 < sizeof(why); ++k) {
++			why[k] = *(volatile char *)(r + k);
++			if (!why[k]) {
++				break;
++			}
++		}
++		why[k] = 0;
++		snprintf(wl_last, sizeof(wl_last), "sGFSR %#x synr %#x/%#x | cb0 FSR %#x FAR %#x%08x FSYNR0 %#x | ssr(421) '%s'\n", gf, gy0, gy1,
++		    fsr, fah, fal, fsy, r ? why : "(none)");
+ 	} else {
+ 		snprintf(wl_last, sizeof(wl_last), "unknown: scan [FLAGS [DA [DP]]], nets, raw CMD BODY, pdev ID VALUE, regd [RD [C2 C5]], chan, ev, last\n");
+ 	}
