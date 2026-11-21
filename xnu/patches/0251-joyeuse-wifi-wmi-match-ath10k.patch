@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index 3d97f61..5907443 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -3278,14 +3278,16 @@ static int
+ wl_wmi_vdev_create(void)
+ {
+ 	uint8_t b[64];
+-	/* 0201: 18 bytes, the exact sizeof(struct wmi_vdev_create_cmd): the extra two pad bytes after the mac address made the
+-	 * firmware drop the command, so there was no vdev at all. */
+-	uint8_t *p = wl_tlv(b, WMI_TAG_VDEV_CREATE_CMD, 18);
++	/* 0251: 20 bytes again. sizeof(struct wmi_vdev_create_cmd) IS 20: struct wmi_mac_addr is a packed union with two u32
++	 * (8 bytes), and ath10k_wmi_tlv_op_gen_vdev_create sends exactly that. 0201's 18 is not a multiple of 4, which QCA's
++	 * TLV checker (wmitlv_check_and_pad_tlvs) is believed to reject (not verified on this firmware). */
++	uint8_t *p = wl_tlv(b, WMI_TAG_VDEV_CREATE_CMD, 20);
+ 	uint32_t v[3] = {0, 2, 0};             /* vdev 0, station, no subtype */
+ 	memcpy(p, v, 12);
+ 	p += 12;
++	memset(p, 0, 8);
+ 	memcpy(p, wl_mac, 6);
+-	p += 6;
++	p += 8;
+ 	return wl_wmi_send(WMI_CMD_VDEV_CREATE, b, (unsigned)(p - b));
+ }
+ 
+@@ -3682,7 +3684,7 @@ wl_htt_rx_setup(void)
+ 		f[0] = 6;                                       /* HTT_H2T_MSG_TYPE_FRAG_DESC_BANK_CFG */
+ 		f[1] = 0;                                       /* info: byte depth, no q state */
+ 		f[2] = 1;                                       /* one bank */
+-		f[3] = 96;                                      /* sizeof(struct htt_msdu_ext_desc_64) */
++		f[3] = 72;                                      /* 0251: sizeof(struct htt_msdu_ext_desc_64) = 20+2+1+1+6*8 (was 96) */
+ 		uint64_t base = wl_htt_frag_pa;
+ 		memcpy(f + 4, &base, 8);                        /* bank_base_addrs[0] */
+ 		uint16_t bid[2] = {0, 63};                      /* bank_min_id, bank_max_id */
+@@ -3758,10 +3760,18 @@ wl_wmi_bringup(void)
+ 		wl_ce_poll();
+ 		touch_wait(10);
+ 	}
+-	wl_wmi_vdev_start();                       /* 0201 */
+-	for (unsigned ms = 0; ms < 1500; ms += 10) {
+-		wl_ce_poll();
+-		touch_wait(10);
++	{
++		/* 0251: ath10k scans with a created, NOT started vdev (vdev start comes with the join, ath10k_vdev_start from
++		 * assign_vif_chanctx); 0201's start on channel 1 is kept for comparison: wlvstart=1 */
++		uint32_t vs = 0;
++		(void)PE_parse_boot_argn("wlvstart", &vs, sizeof(vs));
++		if (vs) {
++			wl_wmi_vdev_start();               /* 0201 */
++			for (unsigned ms = 0; ms < 1500; ms += 10) {
++				wl_ce_poll();
++				touch_wait(10);
++			}
++		}
+ 	}
+ 	wl_wmi_scan();
+ 	wl_wmi_wait(15000, &wl_scan_done);

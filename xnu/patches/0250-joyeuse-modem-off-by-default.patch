@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index f25e574..3d97f61 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -2,7 +2,7 @@
+  * miatoll modem / Wi-Fi bring-up (WCN3990 sits behind the Q6 modem DSP). Included by sweet_touch.c.
+  * Step 1: is the Qualcomm secure monitor (TZ) reachable through SMCCC SIP calls, and does it offer the
+  * peripheral-image-loader (PIL, svc 2) calls the Linux subsys-pil-tz driver uses for the modem (pas-id 4)?
+- * Boot-arg sweetmodem=0 disables the probe.
++ * Boot-arg sweetmodem=1 enables the probe (0250: off unless asked, like miatoll_adreno.c already assumes).
+  */
+ #include <sys/vnode_internal.h>
+ #include <sys/sysctl.h>
+@@ -4859,7 +4859,7 @@ sweet_modem_start(void)
+ 			thread_deallocate(bt);
+ 		}
+ 	}
+-	int enabled = 1;
++	int enabled = 0;                /* 0250: modem, WLAN firmware and the SMMU writes only with sweetmodem=1 */
+ 	thread_t thread;
+ 	(void)PE_parse_boot_argn("sweetmodem", &enabled, sizeof(enabled));
+ 	if (!enabled) {
