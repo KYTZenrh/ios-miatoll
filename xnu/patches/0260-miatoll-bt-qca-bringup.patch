@@ -1,0 +1,747 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index d020838..e0387ab 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/redwood_net.c			standard
+ bsd/dev/redwood_apple80211.c		standard
+ bsd/dev/redwood_sta.c			standard
+ bsd/dev/miatoll_wifi.c			standard
++bsd/dev/miatoll_bt.c			standard
+ bsd/dev/miatoll_adreno.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/miatoll_bt.c b/bsd/dev/miatoll_bt.c
+new file mode 100644
+index 0000000..9dae43c
+--- /dev/null
++++ b/bsd/dev/miatoll_bt.c
+@@ -0,0 +1,697 @@
++/*
++ * miatoll Bluetooth milestone 1: power the WCN399x BT core, load its Qualcomm firmware over the HS-UART and run
++ * HCI Reset / Read Local Version / Read BD_ADDR. Everything is logged ("SWEET BT:"); no device node, no IOKit
++ * service, nothing userland can see. Off by default: boot-arg miatollbt=1 (miatollbtdelay=<s>, default 60).
++ *
++ * Hardware (live DT, Lineage atoll.dtsi / atoll-qupv3.dtsi): /soc/bt_wcn3990 (qca,wcn3990, no enable GPIO; rails
++ * pm6150_l10 IO 1.8 V, pm6150l_l1 XO 1.8 V, pm6150l_l2 RF 1.304 V, pm6150l_l10 CH0 3.0-3.3 V, the last three shared
++ * with WLAN) on /soc/qcom,qup_uart@88c000 (QUP0 SE3, msm-geni-serial-hs): GPIO38 CTS, 39 RTS, 40 TX, 41 RX, func
++ * qup03, TLMM SOUTH tile. Clocks: GCC 0x52008 bits 6/7/8/9 (wrap0 m-ahb/s-ahb/core/core2x) and 13 (SE3), RCG 0x173c4
++ * (DFS; boot firmware programs the perf levels, msm_geni_serial picks the 7.3728 MHz one).
++ * Bring-up = upstream hci_qca/btqca for WCN399x: rails, power pulses 0xC0 @2400 then 0xFC @115200 (CTS ignored),
++ * EDL version (VSC 0xFC00 0x19), rampatch CRBTFWxx.TLV and NVM CRNVxx.BIN in 243-byte EDL_PATCH_TLV segments
++ * (0xFC00 0x1E). Stays at 115200: the NVM baud byte is set to 0 (115200) and in-band sleep / deep sleep are cleared,
++ * because nothing on the host speaks the IBS protocol. Firmware: copy IMAGE/CRBTFW*.TLV + CRNV*.BIN from the phone's
++ * `bluetooth` partition (FAT) to /private/var/miatoll/bt/.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++void miatoll_bt_init(void);
++
++#define BT_FW_DIR       "/private/var/miatoll/bt/"
++#define BT_SE_PA        0x0088c000u
++#define BT_GCC_PA       0x00100000u
++#define BT_TLMM_PA      0x03d26000u             /* TLMM 0x3400000 + SOUTH 0x900000 + GPIO38 * 0x1000 */
++#define BT_GPIO(n)      (((n) - 38u) * 0x1000u)
++#define BT_GCC_VOTE     0x52008u
++#define BT_GCC_BITS     ((1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 13))
++#define BT_RCG          0x173c4u
++#define BT_SE_HZ        7372800u                /* UART oversampling 32: 115200 -> div 2, 2400 -> div 96 */
++
++/* GENI registers (qcom-geni-se.h; same offsets as sweet_touch.c) */
++#define SE_FORCE_DEF    0x020u
++#define SE_OUT_CTRL     0x024u
++#define SE_CGC_CTRL     0x028u
++#define SE_STATUS       0x040u
++#define SE_M_CLK_CFG    0x048u
++#define SE_S_CLK_CFG    0x04cu
++#define SE_IF_DISABLE   0x064u
++#define SE_FW_REV       0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_UART_LOOP    0x22cu
++#define SE_DMA_MODE     0x258u
++#define SE_UART_TX_CFG  0x25cu
++#define SE_TX_PACK0     0x260u
++#define SE_TX_PACK1     0x264u
++#define SE_UART_TX_WLEN 0x268u
++#define SE_UART_TX_STOP 0x26cu
++#define SE_UART_TX_LEN  0x270u
++#define SE_UART_RX_CFG  0x280u
++#define SE_RX_PACK0     0x284u
++#define SE_RX_PACK1     0x288u
++#define SE_UART_RX_WLEN 0x28cu
++#define SE_UART_STALE   0x294u
++#define SE_UART_TX_PAR  0x2a4u
++#define SE_UART_RX_PAR  0x2a8u
++#define SE_UART_RFR     0x2acu
++#define SE_M_CMD0       0x600u
++#define SE_M_CMD_CTRL   0x604u
++#define SE_M_IRQ        0x610u
++#define SE_M_IRQ_EN     0x614u
++#define SE_M_IRQ_CLR    0x618u
++#define SE_S_CMD0       0x630u
++#define SE_S_CMD_CTRL   0x634u
++#define SE_S_IRQ        0x640u
++#define SE_S_IRQ_EN     0x644u
++#define SE_S_IRQ_CLR    0x648u
++#define SE_TX_FIFO      0x700u
++#define SE_RX_FIFO      0x780u
++#define SE_TX_STATUS    0x800u
++#define SE_RX_STATUS    0x804u
++#define SE_TX_WM        0x80cu
++#define SE_RX_WM        0x810u
++#define SE_RX_RFR_WM    0x814u
++#define SE_GSI_EV_EN    0xe18u
++#define SE_IRQ_EN       0xe1cu
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_DMA_GEN_CFG  0xe30u
++#define SE_PACK0        0x0004380eu             /* 8 bits x 4 per FIFO word, LSB first (geni_se_config_packing) */
++#define SE_PACK1        0x000c3e0eu
++#define UART_CTS_MASK   (1u << 1)
++#define M_ACTIVE        (1u << 0)
++#define S_ACTIVE        (1u << 12)
++#define CMD_START       (1u << 27)              /* UART_START_TX / UART_START_READ (opcode 1) */
++#define CMD_CANCEL      (1u << 2)
++#define CMD_ABORT       (1u << 1)
++
++#define EDL_OP          0xfc00u
++#define EDL_VER_REQ     0x19u
++#define EDL_TLV_REQ     0x1eu
++#define EDL_TLV_RES     0x04u
++#define EDL_SEG         243u
++#define QCA_WCN3991_SOC 0x40014320u
++
++static vm_offset_t bt_se, bt_gcc, bt_tlmm;
++static unsigned bt_txdepth;
++static int bt_chan;
++static uint8_t bt_rx[512];
++static unsigned bt_rx_head, bt_rx_tail;
++
++static uint32_t
++bt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++bt_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++bt_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&bt_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++bt_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask, unsigned us)
++{
++	for (unsigned i = 0; i < us; ++i) {
++		if (!(bt_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++bt_gpio(unsigned pin, unsigned pull)
++{
++	/* func 1 = qup03, 2 mA, input (the SE drives TX/RTS); pulls as the DT "active" state */
++	uint32_t cfg = bt_rd(bt_tlmm, BT_GPIO(pin));
++	bt_wr(bt_tlmm, BT_GPIO(pin), (cfg & ~0x3ffu) | (1u << 2) | pull);
++}
++
++static int
++bt_clocks(void)
++{
++	bt_wr(bt_gcc, BT_GCC_VOTE, bt_rd(bt_gcc, BT_GCC_VOTE) | BT_GCC_BITS);
++	if (!(bt_rd(bt_gcc, BT_RCG + 0x14u) & 1u)) {
++		/* shortcut: no RCG programming; boot firmware has always enabled DFS on QUP RCGs so far */
++		printf("SWEET BT: SE3 RCG has no DFS table; need clock integration\n");
++		return -1;
++	}
++	int level = -1;
++	for (unsigned l = 0; l < 16; ++l) {
++		uint32_t cfg = bt_rd(bt_gcc, BT_RCG + 0x1cu + 4u * l);
++		uint32_t src = (cfg >> 8) & 7u, hid = cfg & 0x1fu, mode = (cfg >> 12) & 3u;
++		/* gcc_parent_map_1: 0 XO, 1 GPLL0, 2 GPLL6, 6 GPLL0 even */
++		uint64_t hz = src == 0 ? 19200000ULL : src == 1 ? 600000000ULL : src == 2 ? 384000000ULL :
++		    src == 6 ? 300000000ULL : 0;
++		if (hz && hid) {
++			hz = hz * 2 / (hid + 1);
++		}
++		if (hz && mode) {
++			uint32_t m = bt_rd(bt_gcc, BT_RCG + 0x5cu + 4u * l) & 0xffffu;
++			uint32_t n = ((~bt_rd(bt_gcc, BT_RCG + 0x9cu + 4u * l)) & 0xffffu) + m;
++			hz = n ? hz * m / n : 0;
++		}
++		printf("SWEET BT: DFS level %u cfg %#x -> %llu Hz\n", l, cfg, hz);
++		if (hz == BT_SE_HZ && level < 0) {
++			level = (int)l;
++		}
++	}
++	if (level < 0) {
++		printf("SWEET BT: no 7.3728 MHz DFS level\n");
++		return -1;
++	}
++	const uint32_t branches[] = {0x17004, 0x17008, 0x1700c, 0x17014, 0x173c0};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!bt_wait_clear(bt_gcc, branches[i], 1u << 31, 5000)) {
++			printf("SWEET BT: GCC branch %#x halted (%#x)\n", branches[i], bt_rd(bt_gcc, branches[i]));
++			return -1;
++		}
++	}
++	return level;
++}
++
++static void
++bt_rx_stop(void)
++{
++	if (bt_rd(bt_se, SE_STATUS) & S_ACTIVE) {
++		bt_wr(bt_se, SE_S_CMD_CTRL, CMD_CANCEL);
++		if (!bt_wait_clear(bt_se, SE_STATUS, S_ACTIVE, 10000)) {
++			bt_wr(bt_se, SE_S_CMD_CTRL, CMD_ABORT);
++			(void)bt_wait_clear(bt_se, SE_STATUS, S_ACTIVE, 10000);
++		}
++	}
++	bt_wr(bt_se, SE_S_IRQ_CLR, 0xffffffffu);
++}
++
++/* baud: 2400 or 115200; flow: honour CTS and let the SE drive RTS from the RX FIFO level */
++static void
++bt_uart_cfg(unsigned baud, bool flow)
++{
++	uint32_t div = BT_SE_HZ / (baud * 32u);
++	bt_rx_stop();
++	bt_wr(bt_se, SE_UART_TX_CFG, flow ? 0 : UART_CTS_MASK);
++	bt_wr(bt_se, SE_M_CLK_CFG, (div << 4) | 1u);
++	bt_wr(bt_se, SE_S_CLK_CFG, (div << 4) | 1u);
++	(void)bt_rd(bt_se, SE_M_CLK_CFG);
++	bt_wr(bt_se, SE_UART_RFR, 0);           /* manual RFR off: hardware flow */
++	bt_wr(bt_se, SE_S_CMD0, CMD_START);     /* UART_START_READ */
++}
++
++static bool
++bt_se_init(int level)
++{
++	uint32_t fw = bt_rd(bt_se, SE_FW_REV), tx = bt_rd(bt_se, SE_HW_TX), rx = bt_rd(bt_se, SE_HW_RX);
++	printf("SWEET BT: se3 fw=%#x proto=%u status=%#x tx=%#x rx=%#x\n", fw, (fw >> 8) & 0xffu,
++	    bt_rd(bt_se, SE_STATUS), tx, rx);
++	if (((fw >> 8) & 0xffu) != 2u || (bt_rd(bt_se, SE_IF_DISABLE) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 4u || ((rx >> 16) & 0x3fu) < 4u) {
++		printf("SWEET BT: SE3 is not a UART with 32-bit FIFOs; stopping\n");
++		return false;
++	}
++	if (bt_rd(bt_se, SE_STATUS) & M_ACTIVE) {
++		printf("SWEET BT: SE3 TX already busy; stopping\n");
++		return false;
++	}
++	unsigned rxdepth = (rx >> 16) & 0x3fu;
++	bt_txdepth = (tx >> 16) & 0x3fu;
++	bt_wr(bt_se, SE_GSI_EV_EN, 0);
++	bt_wr(bt_se, SE_IRQ_EN, 0);             /* nothing routed to the GIC: polled */
++	bt_wr(bt_se, SE_DMA_MODE, 0);           /* FIFO mode */
++	bt_wr(bt_se, SE_CGC_CTRL, bt_rd(bt_se, SE_CGC_CTRL) | 0x7fu);
++	bt_wr(bt_se, SE_DMA_GEN_CFG, bt_rd(bt_se, SE_DMA_GEN_CFG) | 0x0fu);
++	bt_wr(bt_se, SE_OUT_CTRL, 0x7f);
++	bt_wr(bt_se, SE_FORCE_DEF, 1);
++	bt_wr(bt_se, SE_CLK_SEL, (uint32_t)level);
++	bt_wr(bt_se, SE_TX_PACK0, SE_PACK0);
++	bt_wr(bt_se, SE_TX_PACK1, SE_PACK1);
++	bt_wr(bt_se, SE_RX_PACK0, SE_PACK0);
++	bt_wr(bt_se, SE_RX_PACK1, SE_PACK1);
++	bt_wr(bt_se, SE_UART_LOOP, 0);
++	bt_wr(bt_se, SE_UART_TX_PAR, 0);
++	bt_wr(bt_se, SE_UART_RX_CFG, 0);
++	bt_wr(bt_se, SE_UART_RX_PAR, 0);
++	bt_wr(bt_se, SE_UART_TX_WLEN, 8);
++	bt_wr(bt_se, SE_UART_RX_WLEN, 8);
++	bt_wr(bt_se, SE_UART_TX_STOP, 0);
++	bt_wr(bt_se, SE_UART_STALE, 10u * 16u);
++	bt_wr(bt_se, SE_TX_WM, 0);
++	bt_wr(bt_se, SE_RX_WM, rxdepth / 2u);
++	bt_wr(bt_se, SE_RX_RFR_WM, rxdepth - 2u);
++	bt_wr(bt_se, SE_M_IRQ_EN, 0x3fu);       /* status latches for done/overrun/illegal/failure/cancel/abort */
++	bt_wr(bt_se, SE_S_IRQ_EN, 0x3fu | (3u << 26));
++	bt_wr(bt_se, SE_M_IRQ_CLR, 0xffffffffu);
++	bt_wr(bt_se, SE_S_IRQ_CLR, 0xffffffffu);
++	if (bt_rd(bt_se, SE_TX_PACK0) != SE_PACK0 || bt_rd(bt_se, SE_RX_PACK1) != SE_PACK1) {
++		printf("SWEET BT: packing readback mismatch; stopping\n");
++		return false;
++	}
++	return true;
++}
++
++static int
++bt_tx(const uint8_t *buf, unsigned n)
++{
++	if (!bt_wait_clear(bt_se, SE_STATUS, M_ACTIVE, 100000)) {
++		return EBUSY;
++	}
++	bt_wr(bt_se, SE_M_IRQ_CLR, 0xffffffffu);
++	bt_wr(bt_se, SE_UART_TX_LEN, n);
++	bt_wr(bt_se, SE_M_CMD0, CMD_START);     /* UART_START_TX */
++	for (unsigned i = 0; i < n; i += 4) {
++		unsigned spins = 0;
++		while ((bt_rd(bt_se, SE_TX_STATUS) & 0x0fffffffu) >= bt_txdepth) {
++			if (++spins > 2000000u) {       /* ~2 s: CTS held off by the chip */
++				goto stuck;
++			}
++			delay(1);
++		}
++		uint32_t w = 0;
++		for (unsigned k = 0; k < 4 && i + k < n; ++k) {
++			w |= (uint32_t)buf[i + k] << (8u * k);
++		}
++		bt_wr(bt_se, SE_TX_FIFO, w);
++	}
++	for (unsigned ms = 0; ms < 2000; ++ms) {
++		if (bt_rd(bt_se, SE_M_IRQ) & 1u) {      /* M_CMD_DONE */
++			bt_wr(bt_se, SE_M_IRQ_CLR, bt_rd(bt_se, SE_M_IRQ));
++			return 0;
++		}
++		bt_wait(1);
++	}
++stuck:
++	printf("SWEET BT: tx of %u bytes stuck (status %#x m-irq %#x fifo %#x); cancelling\n", n,
++	    bt_rd(bt_se, SE_STATUS), bt_rd(bt_se, SE_M_IRQ), bt_rd(bt_se, SE_TX_STATUS));
++	bt_wr(bt_se, SE_M_CMD_CTRL, CMD_CANCEL);
++	if (!bt_wait_clear(bt_se, SE_STATUS, M_ACTIVE, 10000)) {
++		bt_wr(bt_se, SE_M_CMD_CTRL, CMD_ABORT);
++		(void)bt_wait_clear(bt_se, SE_STATUS, M_ACTIVE, 10000);
++	}
++	bt_wr(bt_se, SE_M_IRQ_CLR, 0xffffffffu);
++	return ETIMEDOUT;
++}
++
++static void
++bt_rx_poll(void)
++{
++	uint32_t st = bt_rd(bt_se, SE_RX_STATUS);
++	uint32_t wc = st & 0x1ffffffu;
++	for (uint32_t i = 0; i < wc; ++i) {
++		uint32_t w = bt_rd(bt_se, SE_RX_FIFO);
++		unsigned bytes = 4;
++		if (i == wc - 1 && (st & (1u << 31)) && ((st >> 28) & 7u)) {
++			bytes = (st >> 28) & 7u;        /* RX_LAST: partial last word */
++		}
++		for (unsigned k = 0; k < bytes; ++k) {
++			unsigned next = (bt_rx_head + 1) % sizeof(bt_rx);
++			if (next == bt_rx_tail) {
++				printf("SWEET BT: rx buffer overflow\n");
++				break;
++			}
++			bt_rx[bt_rx_head] = (uint8_t)(w >> (8u * k));
++			bt_rx_head = next;
++		}
++	}
++	if (wc) {
++		bt_wr(bt_se, SE_S_IRQ_CLR, bt_rd(bt_se, SE_S_IRQ));
++	}
++}
++
++static int
++bt_getc(unsigned timeout_ms)
++{
++	for (unsigned ms = 0;; ++ms) {
++		bt_rx_poll();
++		if (bt_rx_tail != bt_rx_head) {
++			uint8_t c = bt_rx[bt_rx_tail];
++			bt_rx_tail = (bt_rx_tail + 1) % sizeof(bt_rx);
++			return c;
++		}
++		if (ms >= timeout_ms) {
++			return -1;
++		}
++		bt_wait(1);
++	}
++}
++
++/* next H4 event: returns the event code and its parameters (len <= 255), -1 on timeout */
++static int
++bt_event(uint8_t *p, unsigned *len, unsigned timeout_ms)
++{
++	for (;;) {
++		int t = bt_getc(timeout_ms);
++		if (t < 0) {
++			return -1;
++		}
++		if (t == 0x02) {                        /* ACL: skip */
++			int h[4];
++			for (int i = 0; i < 4; ++i) {
++				if ((h[i] = bt_getc(100)) < 0) {
++					return -1;
++				}
++			}
++			for (unsigned n = (unsigned)h[2] | ((unsigned)h[3] << 8); n; --n) {
++				if (bt_getc(100) < 0) {
++					return -1;
++				}
++			}
++			continue;
++		}
++		if (t != 0x04) {
++			printf("SWEET BT: stray byte %#x\n", t);
++			continue;
++		}
++		int code = bt_getc(100), l = bt_getc(100);
++		if (code < 0 || l < 0) {
++			return -1;
++		}
++		for (int i = 0; i < l; ++i) {
++			int c = bt_getc(100);
++			if (c < 0) {
++				return -1;
++			}
++			p[i] = (uint8_t)c;
++		}
++		*len = (unsigned)l;
++		return code;
++	}
++}
++
++static int
++bt_cmd(uint16_t op, const uint8_t *param, unsigned plen)
++{
++	static uint8_t pkt[4 + 255];
++	pkt[0] = 0x01;
++	pkt[1] = (uint8_t)op;
++	pkt[2] = (uint8_t)(op >> 8);
++	pkt[3] = (uint8_t)plen;
++	if (plen) {
++		memcpy(pkt + 4, param, plen);
++	}
++	return bt_tx(pkt, 4 + plen);
++}
++
++/*
++ * Wait for the answer to op: Command Complete/Status for op (returns its status byte and copies the return
++ * parameters), or, when vse >= 0, a vendor event (0xff) whose first two bytes are 00 <vse> (returns 0).
++ */
++static int
++bt_wait_answer(uint16_t op, int vse, uint8_t *out, unsigned *olen, unsigned timeout_ms)
++{
++	uint8_t p[255];
++	unsigned len = 0;
++	for (unsigned tries = 0; tries < 16; ++tries) {
++		int code = bt_event(p, &len, timeout_ms);
++		if (code < 0) {
++			return -1;
++		}
++		if (code == 0x0e && len >= 4 && (p[1] | (p[2] << 8)) == op) {
++			if (out) {
++				memcpy(out, p + 3, len - 3);
++				*olen = len - 3;
++			}
++			/* VSC: the vendor event normally carries the answer; WCN3991 acks TLV segments with a CC */
++			if (vse < 0 || p[3] || vse == (int)EDL_TLV_RES) {
++				return p[3];
++			}
++			continue;
++		}
++		if (code == 0x0f && len >= 4 && (p[2] | (p[3] << 8)) == op) {
++			if (p[0] || vse < 0) {
++				return p[0] ? p[0] : 0;
++			}
++			continue;
++		}
++		if (code == 0xff && vse >= 0 && len >= 2 && p[0] == 0x00 && p[1] == (uint8_t)vse) {
++			if (out) {
++				memcpy(out, p + 2, len - 2);
++				*olen = len - 2;
++			}
++			return 0;
++		}
++		printf("SWEET BT: event %#x len %u (%02x %02x %02x %02x) while waiting for %#x\n", code, len,
++		    len > 0 ? p[0] : 0, len > 1 ? p[1] : 0, len > 2 ? p[2] : 0, len > 3 ? p[3] : 0, op);
++	}
++	return -1;
++}
++
++static uint8_t *
++bt_load(const char *name, size_t *sizep)
++{
++	char path[96];
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	snprintf(path, sizeof(path), "%s%s", BT_FW_DIR, name);
++	int e = vnode_lookup(path, 0, &vp, ctx);
++	if (e) {
++		printf("SWEET BT: %s: not found (%d)\n", path, e);
++		return NULL;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	e = vnode_getattr(vp, &va, ctx);
++	size_t size = e ? 0 : (size_t)va.va_data_size;
++	uint8_t *buf = NULL;
++	if (size < 16 || size > 512u * 1024u || (buf = kalloc_data(size, Z_WAITOK)) == NULL) {
++		printf("SWEET BT: %s: bad size %zu (%d)\n", path, size, e);
++		vnode_put(vp);
++		return NULL;
++	}
++	int resid = 0;
++	e = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, IO_NOAUTH | IO_NODELOCKED,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	vnode_put(vp);
++	if (e || resid) {
++		printf("SWEET BT: %s: read failed %d resid %d\n", path, e, resid);
++		kfree_data(buf, size);
++		return NULL;
++	}
++	*sizep = size;
++	return buf;
++}
++
++/* NVM tag set (upstream qca_tlv_check_data): 115200, no in-band sleep, no deep sleep */
++static void
++bt_nvm_fix(uint8_t *d, size_t size, bool wcn3991_layout)
++{
++	size_t off = 0;
++	uint32_t tl = d[0] | (d[1] << 8) | (d[2] << 16) | ((uint32_t)d[3] << 24);
++	if ((tl & 0xffu) == 4 && size >= 8) {   /* type-4 container: first set follows */
++		off = 4;
++		tl = d[4] | (d[5] << 8) | (d[6] << 16) | ((uint32_t)d[7] << 24);
++	}
++	size_t end = off + 4 + (tl >> 8);
++	if ((tl & 0xffu) != 2 || end > size) {
++		printf("SWEET BT: NVM tag set type %u len %u not understood; sent unchanged\n", tl & 0xffu, tl >> 8);
++		return;
++	}
++	for (size_t i = off + 4; i + 12 <= end;) {
++		unsigned id = d[i] | (d[i + 1] << 8), len = d[i + 2] | (d[i + 3] << 8);
++		uint8_t *v = d + i + 12;
++		if (i + 12 + len > end) {
++			break;
++		}
++		if (id == 17 && len >= 3) {
++			v[0] &= (uint8_t)~0x80u;
++			v[wcn3991_layout ? 1 : 2] = 0; /* QCA_BAUDRATE_115200 */
++			printf("SWEET BT: NVM tag 17 -> %02x %02x %02x\n", v[0], v[1], v[2]);
++		} else if (id == 27 && len >= 1) {
++			v[0] &= (uint8_t)~0x01u;
++			if (wcn3991_layout && len >= 2) {
++				v[1] &= (uint8_t)~0x01u;
++			}
++			printf("SWEET BT: NVM tag 27 -> %02x\n", v[0]);
++		}
++		i += 12 + len;
++	}
++}
++
++static int
++bt_download(const char *name, bool patch, bool wcn3991_layout)
++{
++	size_t size = 0;
++	uint8_t *fw = bt_load(name, &size);
++	if (!fw) {
++		return ENOENT;
++	}
++	/* rampatch: tlv_type_patch.download_mode (byte 14); 3 = no event per segment, only for the last one */
++	unsigned mode = patch ? fw[14] : 0;
++	if (!patch) {
++		bt_nvm_fix(fw, size, wcn3991_layout);
++	}
++	printf("SWEET BT: %s: %zu bytes, mode %u\n", name, size, mode);
++	int e = 0;
++	uint8_t cmd[2 + EDL_SEG], res[255];
++	for (size_t off = 0; off < size && !e; off += EDL_SEG) {
++		unsigned seg = (size - off) < EDL_SEG ? (unsigned)(size - off) : EDL_SEG;
++		bool last = off + seg >= size;
++		cmd[0] = EDL_TLV_REQ;
++		cmd[1] = (uint8_t)seg;
++		memcpy(cmd + 2, fw + off, seg);
++		e = bt_cmd(EDL_OP, cmd, 2 + seg);
++		if (e || (mode && !last)) {
++			continue;
++		}
++		unsigned rl = 0;
++		int r = bt_wait_answer(EDL_OP, EDL_TLV_RES, res, &rl, 2000);
++		if (r != 0 || (rl >= 1 && res[0])) {
++			printf("SWEET BT: %s segment @%zu: answer %d result %#x\n", name, off, r, rl ? res[0] : 0);
++			e = EIO;
++		}
++	}
++	kfree_data(fw, size);
++	printf("SWEET BT: %s download %s (%d)\n", name, e ? "FAILED" : "done", e);
++	return e;
++}
++
++static void
++bt_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	unsigned delay_s = 60;
++	(void)PE_parse_boot_argn("miatollbtdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET BT: starting in %u s\n", delay_s);
++	bt_wait(delay_s * 1000u);
++	bt_gcc = ml_io_map(BT_GCC_PA, 0x60000);
++	bt_tlmm = ml_io_map(BT_TLMM_PA, 0x4000);
++	bt_se = ml_io_map(BT_SE_PA, 0x4000);
++	if (!bt_gcc || !bt_tlmm || !bt_se) {
++		printf("SWEET BT: MMIO mapping failed\n");
++		goto out;
++	}
++	int level = bt_clocks();
++	if (level < 0 || !bt_se_init(level)) {
++		goto out;
++	}
++	bt_gpio(38, 0);         /* CTS, no pull */
++	bt_gpio(39, 1);         /* RTS, pull-down */
++	bt_gpio(40, 3);         /* TX, pull-up */
++	bt_gpio(41, 0);         /* RX, no pull */
++	/* qca_regulator_enable order: vddio, vddxo, vddrf, vddch0 (BT DT levels; L10C as WLAN votes it) */
++	static const struct { const char *name; unsigned mv; } rails[] = {
++		{"ldoa10", 1800}, {"ldoc1", 1800}, {"ldoc2", 1304}, {"ldoc10", 3300},
++	};
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); ++i) {
++		int e = sweet_rpmh_vreg_enable(rails[i].name, rails[i].mv);
++		printf("SWEET BT: rail %s %u mV -> %d\n", rails[i].name, rails[i].mv, e);
++		if (e) {
++			goto out;
++		}
++		bt_wait(5);
++	}
++	/* qca_wcn3990_init: off pulse at 2400, on pulse at 115200, CTS ignored, 100 ms boot */
++	static const uint8_t off = 0xc0, on = 0xfc;
++	bt_uart_cfg(2400, false);
++	int e1 = bt_tx(&off, 1);
++	bt_wait(10);
++	bt_uart_cfg(115200, false);
++	int e2 = bt_tx(&on, 1);
++	bt_wait(100);
++	bt_uart_cfg(115200, true);      /* restart RX = the serdev reopen upstream does to resync RTS/CTS */
++	bt_rx_head = bt_rx_tail = 0;
++	printf("SWEET BT: power pulses %d/%d, CTS now %s\n", e1, e2,
++	    (bt_rd(bt_se, 0x908) & 2u) ? "asserted" : "deasserted");     /* SE_GENI_IOS bit1 = CTS */
++
++	uint8_t ver[255];
++	unsigned vl = 0;
++	int r = -1;
++	for (int tries = 0; tries < 3 && r != 0; ++tries) {
++		uint8_t q = EDL_VER_REQ;
++		if (!bt_cmd(EDL_OP, &q, 1)) {
++			r = bt_wait_answer(EDL_OP, EDL_VER_REQ, ver, &vl, 1000);
++		}
++	}
++	if (r != 0 || vl < 12) {
++		printf("SWEET BT: no version answer (%d, %u bytes); controller not talking\n", r, vl);
++		goto out;
++	}
++	uint32_t product = ver[0] | (ver[1] << 8) | (ver[2] << 16) | ((uint32_t)ver[3] << 24);
++	unsigned patchv = ver[4] | (ver[5] << 8), romv = ver[6] | (ver[7] << 8);
++	uint32_t soc = ver[8] | (ver[9] << 8) | (ver[10] << 16) | ((uint32_t)ver[11] << 24);
++	unsigned rom = ((romv & 0x0f00u) >> 4) | (romv & 0x000fu);
++	printf("SWEET BT: product %#x patch %#x rom %#x soc %#x -> firmware %02X\n", product, patchv, romv, soc, rom);
++	char name[16];
++	snprintf(name, sizeof(name), "CRBTFW%02X.TLV", rom);
++	bool wcn3991 = rom >= 0x32;
++	if (bt_download(name, true, wcn3991)) {
++		goto out;
++	}
++	bt_wait(10);
++	snprintf(name, sizeof(name), soc == QCA_WCN3991_SOC ? "CRNV%02XU.BIN" : "CRNV%02X.BIN", rom);
++	if (bt_download(name, false, wcn3991)) {
++		goto out;
++	}
++	bt_wait(10);
++	if (wcn3991) {
++		static const uint8_t nolog[2] = {0x14, 0x00};   /* qca_disable_soc_logging */
++		if (!bt_cmd(0xfc17, nolog, 2)) {
++			printf("SWEET BT: disable logging -> %d\n", bt_wait_answer(0xfc17, -1, NULL, NULL, 1000));
++		}
++	}
++	uint8_t out[255];
++	unsigned ol = 0;
++	int st = bt_cmd(0x0c03, NULL, 0) ? -1 : bt_wait_answer(0x0c03, -1, NULL, NULL, 2000);
++	printf("SWEET BT: HCI_Reset -> %d\n", st);
++	st = bt_cmd(0x1001, NULL, 0) ? -1 : bt_wait_answer(0x1001, -1, out, &ol, 1000);
++	if (st == 0 && ol >= 9) {
++		printf("SWEET BT: Read_Local_Version: HCI %u rev %#x LMP %u manufacturer %u subversion %#x\n",
++		    out[1], out[2] | (out[3] << 8), out[4], out[5] | (out[6] << 8), out[7] | (out[8] << 8));
++	} else {
++		printf("SWEET BT: Read_Local_Version -> %d\n", st);
++	}
++	st = bt_cmd(0x1009, NULL, 0) ? -1 : bt_wait_answer(0x1009, -1, out, &ol, 1000);
++	bool nonzero = false;
++	for (unsigned i = 1; i < 7 && i < ol; ++i) {
++		nonzero |= out[i] != 0;
++	}
++	/* the address itself is not logged (logs get shared) */
++	printf("SWEET BT: Read_BD_ADDR -> %d (%s)\n", st, nonzero ? "non-zero address" : "zero address");
++	printf("SWEET BT: milestone 1 %s; controller left powered at 115200\n", st == 0 ? "PASSED" : "incomplete");
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++miatoll_bt_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	(void)PE_parse_boot_argn("miatollbt", &enabled, sizeof(enabled));
++	if (enabled && kernel_thread_start(bt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index b6c84a2..790535a 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -4959,6 +4959,7 @@ sm_bl_thread(void *arg, wait_result_t result)
+ 
+ extern void sweet_logo_show(void);
+ extern void miatoll_wifi_init(void);
++extern void miatoll_bt_init(void);   /* 0260: bsd/dev/miatoll_bt.c, boot-arg miatollbt=1 */
+ 
+ static void
+ sweet_modem_start(void)
+@@ -4977,6 +4978,7 @@ sweet_modem_start(void)
+ 		(void)sm_bl_apply((unsigned)sm_bl_level);
+ 	}
+ 	miatoll_wifi_init();
++	miatoll_bt_init();
+ 	int bl = 0;
+ 	(void)PE_parse_boot_argn("sweetbl", &bl, sizeof(bl));
+ 	printf("SWEET RESET: sweetbl=%d\n", bl);
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 2e1dbd7..d7985f3 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -333,6 +333,7 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 		{"ldoc1", 1620, 1980},                             /* WCN3990 1.8 V XO */
+ 		{"ldoc2", 1170, 1304},                             /* WCN3990 1.3 V RFA */
+ 		{"ldoa9", 480, 900},                               /* WCN3990 CX/MX */
++		{"ldoa10", 1700, 1900},                            /* WCN3990 BT 1.8 V IO (0260) */
+ 	};
+ 	bool ok = false;
+ 	for (unsigned i = 0; res && i < sizeof(allowed) / sizeof(allowed[0]); ++i) {

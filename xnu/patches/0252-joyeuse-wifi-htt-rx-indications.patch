@@ -1,0 +1,170 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index 5907443..b6c84a2 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -2832,6 +2832,7 @@ wl_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa)
+ /* one HTC message from a receive ring (ath10k_htc_rx_completion_handler, control endpoint only for now) */
+ static void wl_htc_trailer(const uint8_t *t, unsigned len);
+ static void wl_wmi_rx(const uint8_t *d, unsigned n);
++static void wl_htt_t2h(const uint8_t *m, unsigned n);          /* 0252 */
+ 
+ static void
+ wl_htc_rx(unsigned ce, const uint8_t *b, uint32_t n)
+@@ -2865,6 +2866,8 @@ wl_htc_rx(unsigned ce, const uint8_t *b, uint32_t n)
+ 			}
+ 			if (b[0] != 0 && (int)b[0] == wl_wmi_eid) {
+ 				wl_wmi_rx(b + 8, plen - tl);
++			} else if (b[0] != 0 && (int)b[0] == wl_htt_eid) {
++				wl_htt_t2h(b + 8, plen - tl);        /* 0252 */
+ 			}
+ 		}
+ 	}
+@@ -3016,6 +3019,7 @@ static volatile int wl_never;
+ static uint32_t wl_dwell_act = 0x32, wl_dwell_pas = 0x96;     /* 50 and 150 ms */
+ static uint32_t wl_arg_pdev, wl_arg_reorder;     /* 0189: boot-args wlpdev=1, wlreorder=1 switch on what 0187 added (the firmware went silent with both) */
+ static uint32_t wl_ev_id[24], wl_ev_cnt[24];
++static volatile uint32_t wl_cur_mhz;            /* 0252: frequency of the last channel-info event */
+ 
+ static uint8_t *
+ wl_tlv(uint8_t *p, uint16_t tag, uint16_t len)
+@@ -3115,6 +3119,7 @@ wl_wmi_rx(const uint8_t *d, unsigned n)
+ 	if (id == 0x4002u && chan_logged++ < 4000 && n >= 44) {
+ 		uint32_t w[10];
+ 		memcpy(w, d + 4, 40);
++		wl_cur_mhz = w[1];
+ 		printf("SWEET WMI: chan info: err %u freq %u flags %#x noise %d rx_clear %u cycle %u tx_pwr %d %d rx_frames %u\n", w[0], w[1], w[2],
+ 		    (int)w[3], w[4], w[5], (int)w[6], (int)w[7], w[8]);
+ 	}
+@@ -3641,6 +3646,111 @@ wl_htt_send(const uint8_t *msg, uint16_t len)
+ 	return wl_ce_send(4, wl_htt_txb_pa, (uint16_t)(8u + len), 0);
+ }
+ 
++/*
++ * 0252: the target's HTT messages (ath10k_htt_t2h_msg_handler, TLV numbering), only printed before. A filled ring buffer is
++ * the rx descriptor of 0199 (msdu payload at word 90 = 360 bytes, sizeof(struct htt_rx_desc) of the ath10k that ran WCN3990
++ * before the v1/v2 split) and then the frame. RX_IN_ORD_PADDR_IND (0x12) names the buffers by address
++ * (ath10k_htt_rx_pop_paddr64_list); RX_IND (0x1, no full reorder) means the next buffers in ring order whose attention says
++ * MSDU_DONE. A beacon or probe response among them goes to wl_wifi_frame() like a WMI mgmt rx; every buffer goes back into
++ * the ring at the host's alloc index (ath10k __ath10k_htt_rx_ring_fill_n), else the ring runs dry after 63 frames.
++ */
++#define WL_HTT_PAYLOAD          (90u * 4u)
++static uint32_t wl_htt_alloc, wl_htt_rd;
++static uint32_t wl_t2h_cnt[24];
++static unsigned wl_htt_frames, wl_htt_foreign;
++
++static void
++wl_htt_frame(uint64_t pa, unsigned len, int parse)
++{
++	uint64_t off = pa - wl_htt_bufs_pa;
++	if (pa < wl_htt_bufs_pa || off >= (uint64_t)WL_HTT_RING_N * WL_HTT_BUF_SZ || (off % WL_HTT_BUF_SZ) != 0) {
++		if (wl_htt_foreign++ < 4) {
++			printf("SWEET HTT: rx buffer %#llx is not one of ours\n", (unsigned long long)pa);
++		}
++		return;
++	}
++	uint8_t *buf = (uint8_t *)(wl_htt_bufs + (vm_offset_t)off);
++	wl_sync((vm_offset_t)buf, pa, WL_HTT_BUF_SZ);
++	if (parse) {
++		uint32_t att, ms;
++		memcpy(&att, buf + 4, 4);               /* rx_attention.flags (word 1) */
++		memcpy(&ms, buf + 7 * 4, 4);            /* rx_msdu_start info0 (word 7): msdu length in 13:0 */
++		if (!len) {
++			len = ms & 0x3fffu;
++		}
++		if (len > WL_HTT_BUF_SZ - WL_HTT_PAYLOAD) {
++			len = WL_HTT_BUF_SZ - WL_HTT_PAYLOAD;
++		}
++		const uint8_t *f = buf + WL_HTT_PAYLOAD;
++		int snr = buf[27 * 4 + 16];             /* rx_ppdu_start.rssi_comb (word 27, byte 16) */
++		uint32_t mhz = wl_cur_mhz;
++		if (wl_htt_frames++ < 8) {
++			printf("SWEET HTT: rx buf %u att %#x len %u snr %d: %02x %02x %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    (unsigned)(off / WL_HTT_BUF_SZ), att, len, snr, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10],
++			    f[11], f[12], f[13], f[14], f[15]);
++		}
++		wl_wifi_frame(f, len, mhz >= 5000 ? (mhz - 5000) / 5 : mhz > 2407 ? (mhz - 2407) / 5 : 0, snr);
++	}
++	/* back into the ring: descriptor zeroed (MSDU_DONE off), then the address at the alloc index */
++	memset(buf, 0, WL_HTT_PAYLOAD);
++	wl_sync((vm_offset_t)buf, pa, WL_HTT_BUF_SZ);
++	uint64_t *r = (uint64_t *)wl_htt_ring;
++	r[wl_htt_alloc] = pa;
++	wl_sync((vm_offset_t)&r[wl_htt_alloc], wl_htt_ring_pa + (uint64_t)wl_htt_alloc * 8u, 8);
++	wl_htt_alloc = (wl_htt_alloc + 1) & (WL_HTT_RING_N - 1);
++	*(volatile uint32_t *)wl_htt_idx = wl_htt_alloc;
++	wl_sync(wl_htt_idx, wl_htt_idx_pa, 4);
++}
++
++static void
++wl_htt_t2h(const uint8_t *m, unsigned n)
++{
++	if (n < 4) {
++		return;
++	}
++	unsigned t = m[0];
++	if (t < 24) {
++		wl_t2h_cnt[t]++;
++	}
++	if (t == 0) {                                   /* VERSION_CONF: msg type, minor, major */
++		printf("SWEET HTT: target HTT version %u.%u\n", m[2], m[1]);
++		return;
++	}
++	if (!wl_htt_ring) {
++		return;
++	}
++	if (t == 0x12 && n >= 8) {
++		uint16_t cnt;
++		memcpy(&cnt, m + 6, 2);                 /* type, info, peer id (2), vdev, reserved, msdu count (2) */
++		int offload = (m[1] & 0x20) != 0;      /* HTT_RX_IN_ORD_IND_INFO_OFFLOAD: firmware-made frames, no rx descriptor */
++		for (unsigned i = 0; i < cnt && 8u + 12u * (i + 1) <= n; ++i) {
++			uint64_t pa;
++			uint16_t len;
++			memcpy(&pa, m + 8 + 12 * i, 8);         /* htt_rx_in_ord_msdu_desc_ext: paddr (8), len (2), fw_desc, reserved */
++			memcpy(&len, m + 16 + 12 * i, 2);
++			wl_htt_frame(pa, len, !offload);
++		}
++	} else if (t == 1) {
++		uint64_t *r = (uint64_t *)wl_htt_ring;
++		for (unsigned k = 0; k < WL_HTT_RING_N; ++k) {
++			wl_sync((vm_offset_t)&r[wl_htt_rd], wl_htt_ring_pa + (uint64_t)wl_htt_rd * 8u, 8);
++			uint64_t pa = r[wl_htt_rd];
++			uint64_t off = pa - wl_htt_bufs_pa;
++			if (pa < wl_htt_bufs_pa || off >= (uint64_t)WL_HTT_RING_N * WL_HTT_BUF_SZ) {
++				break;
++			}
++			uint32_t att;
++			wl_sync(wl_htt_bufs + (vm_offset_t)off, pa, 8);
++			memcpy(&att, (const uint8_t *)(wl_htt_bufs + (vm_offset_t)off) + 4, 4);
++			if (!(att & (1u << 31))) {              /* RX_ATTENTION_FLAGS_MSDU_DONE */
++				break;
++			}
++			wl_htt_rd = (wl_htt_rd + 1) & (WL_HTT_RING_N - 1);
++			wl_htt_frame(pa, 0, 1);
++		}
++	}
++}
++
+ static int
+ wl_htt_rx_setup(void)
+ {
+@@ -3659,6 +3769,7 @@ wl_htt_rx_setup(void)
+ 			r[i] = wl_htt_bufs_pa + (uint64_t)i * WL_HTT_BUF_SZ;
+ 		}
+ 		*(volatile uint32_t *)wl_htt_idx = fill;
++		wl_htt_alloc = fill;                    /* 0252 */
+ 		wl_sync(wl_htt_ring, wl_htt_ring_pa, WL_HTT_RING_N * 8u);
+ 		wl_sync(wl_htt_idx, wl_htt_idx_pa, 4);
+ 	}
+@@ -3785,6 +3896,12 @@ wl_wmi_bringup(void)
+ 	for (unsigned k = 0; k < 24 && wl_ev_id[k]; ++k) {
+ 		printf("SWEET WMI: events %#x: %u\n", wl_ev_id[k], wl_ev_cnt[k]);
+ 	}
++	for (unsigned k = 0; k < 24; ++k) {
++		if (wl_t2h_cnt[k]) {
++			printf("SWEET HTT: messages type %#x: %u\n", k, wl_t2h_cnt[k]);    /* 0252 */
++		}
++	}
++	printf("SWEET HTT: %u rx frames parsed, ring alloc index %u\n", wl_htt_frames, wl_htt_alloc);
+ 	printf("SWEET WMI: scan %s, %u access points\n", wl_scan_done ? "complete" : "did not complete", wl_nbss);
+ 	wl_write_networks();
+ 	/*
