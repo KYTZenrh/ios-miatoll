@@ -1,0 +1,81 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index a19ddbd..9746f04 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -2813,13 +2813,56 @@ wl_w(uint32_t off, uint32_t v)
+ 	__asm__ volatile("dsb sy" : : : "memory");
+ }
+ 
++/*
++ * 0254: the WCN3990 receive path takes 32-bit host addresses (Android gives it IOVAs in 0xa0000000-0xb0000000, qcom,icnss
++ * smmu_iova_base), but XNU only owns RAM above 4 GB (mkadt --highmem). The HTT memory therefore comes from free low-bank DDR
++ * (Linux "System RAM" c0000000-1bfffffff; nothing of ours lives there: framebuffer 0x9c000000), mapped normal non-cacheable,
++ * so it needs no cache maintenance. Boot-arg wllow=0 goes back to XNU pages.
++ */
++#define WL_LOW_PA       0xe0000000ULL
++#define WL_LOW_SIZE     0x100000u
++static vm_offset_t wl_low_va;
++static int wl_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa);
++static uint32_t wl_low_used;
++
+ static void
+ wl_sync(vm_offset_t va, uint64_t pa, uint32_t len)
+ {
+ 	(void)va;
++	if (pa >= WL_LOW_PA && pa < WL_LOW_PA + WL_LOW_SIZE) {
++		__builtin_arm_dsb(0xf);                 /* non-cacheable: only order the accesses */
++		return;
++	}
+ 	flush_dcache64((addr64_t)pa, len, TRUE);        /* clean + invalidate: the device and the CPU both see RAM */
+ }
+ 
++static int
++wl_alloc_low(vm_size_t size, vm_offset_t *va, uint64_t *pa)
++{
++	uint32_t low = 1;
++	(void)PE_parse_boot_argn("wllow", &low, sizeof(low));
++	if (!low) {
++		return wl_alloc(size, va, pa);
++	}
++	if (!wl_low_va) {
++		wl_low_va = ml_io_map_wcomb((vm_offset_t)WL_LOW_PA, WL_LOW_SIZE);
++		if (!wl_low_va) {
++			printf("SWEET HTT: low DMA window map failed\n");
++			return ENOMEM;
++		}
++		printf("SWEET HTT: low DMA window pa %#llx size %#x\n", WL_LOW_PA, WL_LOW_SIZE);
++	}
++	size = (size + PAGE_MASK) & ~(vm_size_t)PAGE_MASK;
++	if (wl_low_used + size > WL_LOW_SIZE) {
++		return ENOMEM;
++	}
++	*va = wl_low_va + wl_low_used;
++	*pa = WL_LOW_PA + wl_low_used;
++	wl_low_used += (uint32_t)size;
++	bzero((void *)*va, size);
++	return 0;
++}
++
+ static int
+ wl_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa)
+ {
+@@ -3765,8 +3808,8 @@ wl_htt_rx_setup(void)
+ 		return ENOENT;
+ 	}
+ 	if (!wl_htt_ring) {
+-		if (wl_alloc(0x1000, &wl_htt_ring, &wl_htt_ring_pa) || wl_alloc(WL_HTT_RING_N * WL_HTT_BUF_SZ, &wl_htt_bufs, &wl_htt_bufs_pa) ||
+-		    wl_alloc(0x1000, &wl_htt_idx, &wl_htt_idx_pa) || wl_alloc(0x1000, &wl_htt_txb, &wl_htt_txb_pa)) {
++		if (wl_alloc_low(0x1000, &wl_htt_ring, &wl_htt_ring_pa) || wl_alloc_low(WL_HTT_RING_N * WL_HTT_BUF_SZ, &wl_htt_bufs, &wl_htt_bufs_pa) ||
++		    wl_alloc_low(0x1000, &wl_htt_idx, &wl_htt_idx_pa) || wl_alloc_low(0x1000, &wl_htt_txb, &wl_htt_txb_pa)) {
+ 			wl_htt_ring = 0;
+ 			return ENOMEM;
+ 		}
+@@ -3792,7 +3835,7 @@ wl_htt_rx_setup(void)
+ 	 */
+ 	int e0 = 0;
+ 	if (!wl_htt_frag) {
+-		if (wl_alloc(8192, &wl_htt_frag, &wl_htt_frag_pa)) {
++		if (wl_alloc_low(8192, &wl_htt_frag, &wl_htt_frag_pa)) {
+ 			return ENOMEM;
+ 		}
+ 	}
