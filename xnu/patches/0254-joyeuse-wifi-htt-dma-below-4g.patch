@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
-index a19ddbd..9746f04 100644
+index a19ddbd..fd90b31 100644
 --- a/bsd/dev/sweet_modem.inc
 +++ b/bsd/dev/sweet_modem.inc
-@@ -2813,13 +2813,56 @@ wl_w(uint32_t off, uint32_t v)
+@@ -2813,13 +2813,57 @@ wl_w(uint32_t off, uint32_t v)
  	__asm__ volatile("dsb sy" : : : "memory");
  }
  
@@ -16,6 +16,7 @@ index a19ddbd..9746f04 100644
 +#define WL_LOW_SIZE     0x100000u
 +static vm_offset_t wl_low_va;
 +static int wl_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 +static uint32_t wl_low_used;
 +
  static void
@@ -59,7 +60,7 @@ index a19ddbd..9746f04 100644
  static int
  wl_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa)
  {
-@@ -3765,8 +3808,8 @@ wl_htt_rx_setup(void)
+@@ -3765,8 +3809,8 @@ wl_htt_rx_setup(void)
  		return ENOENT;
  	}
  	if (!wl_htt_ring) {
@@ -70,7 +71,7 @@ index a19ddbd..9746f04 100644
  			wl_htt_ring = 0;
  			return ENOMEM;
  		}
-@@ -3792,7 +3835,7 @@ wl_htt_rx_setup(void)
+@@ -3792,7 +3836,7 @@ wl_htt_rx_setup(void)
  	 */
  	int e0 = 0;
  	if (!wl_htt_frag) {
