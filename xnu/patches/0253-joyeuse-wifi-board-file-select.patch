@@ -1,0 +1,34 @@
+diff --git a/bsd/dev/sweet_modem.inc b/bsd/dev/sweet_modem.inc
+index 790535a..a19ddbd 100644
+--- a/bsd/dev/sweet_modem.inc
++++ b/bsd/dev/sweet_modem.inc
+@@ -2392,7 +2392,14 @@ wlfw_bdf_download(uint32_t board_id)
+ {
+ 	char name[16];
+ 	vnode_t vp = NULLVP;
+-	snprintf(name, sizeof(name), "BDWLAN.B%02X", board_id & 0xff);
++	/* 0253: the firmware reports no board id on joyeuse (0xff -> generic BDWLAN.BIN); sweetwlboard=<id> picks a board file.
++	 * Names as in the modem partition: bdwlan.bNN below 0x100, bdwlan.NNN (3 hex digits) above. */
++	(void)PE_parse_boot_argn("sweetwlboard", &board_id, sizeof(board_id));
++	if (board_id > 0xff) {
++		snprintf(name, sizeof(name), "BDWLAN.%03X", board_id & 0xfff);
++	} else {
++		snprintf(name, sizeof(name), "BDWLAN.B%02X", board_id & 0xff);
++	}
+ 	if (board_id == 0xff || sm_open(name, &vp)) {
+ 		strlcpy(name, "BDWLAN.BIN", sizeof(name));
+ 		if (sm_open(name, &vp)) {
+@@ -4156,7 +4163,12 @@ wlfw_after_cap(uint32_t board_id)
+ 	uint32_t bdf = 1;                       /* default on since 0137: the modem never fetched BDWLAN itself */
+ 	(void)PE_parse_boot_argn("sweetwlbdf", &bdf, sizeof(bdf));
+ 	if (bdf) {
+-		wlfw_bdf_download(board_id);
++		/* 0253: sweetwlbdf=2 sends only the cal report, so the firmware fetches the board file it wants over TFTP (the name shows its board id) */
++		if (bdf != 2) {
++			wlfw_bdf_download(board_id);
++		} else {
++			printf("SWEET WLFW: no board file sent (sweetwlbdf=2): watch TFTP for bdwlan requests\n");
++		}
+ 		/*
+ 		 * ath10k_qmi_send_cal_report_req(): after the board file the host reports which calibration files it
+ 		 * has (none here: meta_data count 0). The firmware only says FW_READY after this.
